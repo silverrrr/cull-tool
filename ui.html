@@ -1,0 +1,693 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>选图工具</title>
+<style>
+  body{background:#18181b;color:#e9e9ec;font:14px/1.6 system-ui,"Microsoft YaHei",sans-serif;margin:0;padding:0}
+  h1{font-size:18px;margin:0}
+  button{background:#33333c;color:#e9e9ec;border:1px solid #46464f;border-radius:6px;padding:6px 12px;font:inherit;font-size:13px;cursor:pointer}
+  button:hover{background:#3d3d47}
+  button:disabled{background:#2a2a31;color:#6a6a74;cursor:default;border-color:#33333c}
+  button.pri{background:#27ae60;border-color:#27ae60;color:#04220f;font-weight:600}
+  button.pri:hover{background:#2ec26c}
+  button.pri:disabled{background:#2a4f3c;color:#5c7a68;border-color:#2a4f3c}
+  input[type=number],input[type=text],select{background:#2a2a31;color:#eee;border:1px solid #3d3d46;border-radius:6px;padding:5px 8px;font:inherit;font-size:13px}
+  input[type=number]{width:76px}
+  input[type=text]{width:300px}
+  label{font-size:13px;color:#c9c9d2;display:flex;align-items:center;gap:5px}
+  .muted{color:#8f8f99}
+
+  /* ---- 顶部队列条 ---- */
+  #top{background:#202024;border-bottom:1px solid #2e2e36;padding:12px 16px}
+  #top .row1{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  #top .row1 .sp{flex:1}
+  #folders{margin-top:10px;max-height:112px;overflow:auto;
+           background:#17171a;border:1px solid #2e2e36;border-radius:8px;padding:6px}
+  #folders:empty{display:none}
+  .fitem{display:flex;align-items:center;gap:8px;padding:3px 6px;border-radius:5px;font-size:12.5px}
+  .fitem .p{color:#8f8f99;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fitem .tag{font-size:11px;padding:1px 7px;border-radius:99px;background:#3a3a42;color:#bbb;white-space:nowrap}
+  .fitem.run .tag{background:#f0c674;color:#3a2c00}
+  .fitem.ok  .tag{background:#27ae60;color:#062}
+  .fitem.err .tag{background:#c0392b;color:#fff}
+  .fitem button{padding:1px 8px;font-size:12px}
+
+  #status{margin-top:9px;font-size:12.5px;color:#8f8f99;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  /* ---- 筛选栏 ---- */
+  #bar{background:#202024;border-bottom:1px solid #2e2e36;padding:10px 16px;position:sticky;top:0;z-index:20}
+  #bar .row{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+  #bar .row+.row{margin-top:9px}
+  .stat{background:#242429;border-radius:8px;padding:5px 12px;font-size:12.5px}
+  .stat b{font-size:16px}
+  #bar .row .sp{flex:1}
+
+  /* ---- 操作栏 ---- */
+  #act{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+  #dest{font-family:Consolas,monospace;font-size:12.5px}
+
+  /* ---- 卡片 ---- */
+  #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px;align-items:start;padding:16px}
+  #empty{padding:70px 20px;text-align:center;color:#8f8f99}
+  .card{background:#242429;border-radius:10px;overflow:hidden;border:2px solid transparent;position:relative}
+  .card.soft{border-color:#c0392b}
+  .card.best{border-color:#27ae60}
+  .card.sel{border-color:#2f7fd8}
+  .card img{width:100%;display:block;cursor:zoom-in}
+  .pick{position:absolute;top:7px;left:7px;z-index:3;background:rgba(0,0,0,.55);border-radius:5px;padding:2px 5px}
+  .pick input{width:16px;height:16px;vertical-align:middle;cursor:pointer}
+  .info{padding:8px 10px;font-size:12.5px}
+  .name{font-weight:600;font-size:13px}
+  .sc{color:#7fd1a8}
+  .card.soft .sc{color:#ff8a80}
+  .meta{color:#8f8f99;font-size:11.5px;margin-top:3px}
+  .badge{float:right;font-size:11px;padding:1px 7px;border-radius:99px;background:#3a3a42;color:#bbb;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card.soft .badge{background:#c0392b;color:#fff}
+  .card.best .badge{background:#27ae60;color:#062}
+  .legend{color:#8f8f99;font-size:12px;line-height:1.9;padding:0 16px 4px}
+  .sw{display:inline-block;width:11px;height:11px;border-radius:3px;vertical-align:-1px;margin-right:4px}
+
+  /* ---- 大图 ---- */
+  #lb{display:none;position:fixed;inset:0;background:rgba(8,8,10,.95);z-index:100;flex-direction:column;align-items:center;justify-content:center;padding:18px}
+  #lb img{max-width:96vw;max-height:80vh;object-fit:contain;background:#000}
+  #lb .lt{margin-top:10px;font-size:13px;color:#ddd;display:flex;gap:14px;align-items:center}
+  #lb .lt a{color:#7fd1a8;cursor:pointer}
+  #lb .hint{color:#77777f;font-size:12px;margin-top:4px}
+  .nav{position:absolute;top:50%;transform:translateY(-50%);font-size:34px;color:#9a9aa2;cursor:pointer;user-select:none;padding:10px 18px}
+  .nav:hover{color:#fff}
+  #navL{left:6px} #navR{right:6px}
+  #msg{position:fixed;left:50%;transform:translateX(-50%);bottom:22px;background:#242429;border:1px solid #3d3d46;
+       color:#e9e9ec;padding:9px 18px;border-radius:8px;font-size:13px;z-index:200;display:none;max-width:80vw}
+  #msg.bad{border-color:#c0392b;color:#ff8a80}
+</style></head><body>
+
+<div id="top">
+  <div class="row1">
+    <h1>选图工具</h1>
+    <button id="bPick" class="pri">1. 选择照片文件夹(可多选)</button>
+    <button id="bRun" disabled>2. 开始分析</button>
+    <button id="bCancel" class="pri" style="display:none" disabled>取消</button>
+    <label><input type="checkbox" id="cFull"> 全分辨率(慢一些)</label>
+    <div class="sp"></div>
+    <span class="muted" style="font-size:12px">结果只在这个窗口里看, 不写任何文件</span>
+  </div>
+  <div id="folders"></div>
+  <div id="status">就绪 — 先选文件夹, 再点「开始分析」</div>
+</div>
+
+<div id="bar" style="display:none">
+  <div class="row">
+    <label>眼部锐度 &ge; <input type="number" id="fSharp" step="50" placeholder="不限"></label>
+    <label>组内占比 &ge; <input type="number" id="fRatio" min="0" max="100" step="5" placeholder="不限"> %</label>
+    <label><input type="checkbox" id="fBest"> 只看组内胜出</label>
+    <label><input type="checkbox" id="fMulti"> 只看有可比对对象的组</label>
+    <label>对焦依据
+      <select id="fFace"><option value="">全部</option><option value="1">有人脸</option><option value="0">无脸</option></select>
+    </label>
+    <label>AF区域 <select id="fArea"><option value="">全部</option></select></label>
+    <button id="bReset">重置</button>
+  </div>
+  <div class="row" id="act">
+    <span class="stat" style="margin:0">显示 <b id="vcount">0</b> / <b id="tcount">0</b> 张</span>
+    <span class="stat" style="margin:0">已勾选 <b id="scount">0</b> 张</span>
+    <button id="bAll">全选可见</button>
+    <button id="bNone">清空</button>
+    <button id="bInv">反选可见</button>
+    <div class="sp"></div>
+    <input type="text" id="dest" placeholder="目标文件夹" spellcheck="false">
+    <button id="bDest">选择目标…</button>
+    <label style="white-space:nowrap" title="给挑中的每张照片额外生成一张预览 jpg, 集中放到一个文件夹, 方便 AI/别人直接看图">
+      <input type="checkbox" id="cPrev"> 生成预览 jpg
+    </label>
+    <input type="text" id="prevDir" placeholder="预览图放到…" spellcheck="false" style="width:230px" disabled>
+    <button id="bPrevDir" disabled>预览目录…</button>
+    <label style="white-space:nowrap"><input type="checkbox" id="cCopy"> 复制(不移动原片)</label>
+    <button id="bMove" class="pri" disabled>把勾选的移过去</button>
+    <button id="bExpCsv">导出 CSV…</button>
+    <button id="bExpList">导出勾选清单…</button>
+  </div>
+</div>
+
+<div class="legend">
+  <span class="sw" style="background:#27ae60"></span>组内最清晰 &nbsp;&nbsp;
+  <span class="sw" style="background:#c0392b"></span>组内疑似模糊 &nbsp;&nbsp;
+  <span class="sw" style="background:#2f7fd8"></span>已勾选 &nbsp;&nbsp;
+  <span class="sw" style="background:#ff6040"></span>人脸框 &nbsp;&nbsp;
+  <span class="sw" style="background:#00d2ff"></span>评分用的眼睛区域 &nbsp;&nbsp;
+  <span class="sw" style="background:#00dc00"></span>相机设定的对焦点(仅 Flexible Spot)<br>
+  <b>重要</b>: 锐度是眼睛区域的梯度能量, 会受框景大小和光线影响, <b>只有同一组的帧之间比较才有意义</b>。
+  列表按锐度从高到低排, 从上往下扫即可。
+</div>
+
+<div id="empty">先在上面选一个照片文件夹, 然后点「开始分析」。</div>
+<div id="grid"></div>
+
+<div id="lb">
+  <span class="nav" id="navL">&#10094;</span>
+  <img id="lbImg" alt="">
+  <div class="lt"><span id="lbName"></span><a id="lbOrig">在资源管理器中显示原文件</a></div>
+  <div class="hint">&#8592;/&#8594; 切换 &nbsp;&middot;&nbsp; Esc 关闭</div>
+  <span class="nav" id="navR">&#10095;</span>
+</div>
+
+<div id="msg"></div>
+
+<script>
+var api = window.pywebview ? window.pywebview.api : null;
+var CARDS = [];          // 当前已加载的全部卡片
+var SEL = {};            // 勾选状态: name -> true
+var CUR = null;          // 当前文件夹
+var FOLDERS = [];        // [{path, state}]  state: run|ok|err
+var RUNNING = false;
+var OFF = 0, TOTAL = 0, MORE = false, LOADING = false;
+var LB = [];             // lightbox 列表 (当前可见的卡片)
+var lbi = 0;
+
+function $(id){ return document.getElementById(id); }
+
+function say(t, bad){
+  var m = $('msg');
+  m.textContent = t;
+  m.className = bad ? 'bad' : '';
+  m.style.display = 'block';
+  clearTimeout(m._t);
+  m._t = setTimeout(function(){ m.style.display='none'; }, bad ? 7000 : 3200);
+}
+
+/* ================= 文件夹队列 ================= */
+function drawFolders(){
+  var box = $('folders');
+  box.innerHTML = '';
+  FOLDERS.forEach(function(f, idx){
+    var d = document.createElement('div');
+    d.className = 'fitem ' + f.state;
+    var tag = f.state === 'run' ? '分析中' : (f.state === 'ok' ? '已完成' :
+              (f.state === 'err' ? '出错' : '待分析'));
+    d.innerHTML = '<span class="p"></span><span class="tag"></span>' +
+                  '<button title="移除">×</button>';
+    d.querySelector('.p').textContent = f.path;
+    d.querySelector('.tag').textContent = tag;
+    d.querySelector('button').onclick = async function(){
+      // 正在分析中的文件夹不能从这里删, 要走「取消」
+      if (f.state === 'run'){ say('正在分析中, 请先点「取消」', true); return; }
+      FOLDERS.splice(idx, 1);
+      if (CUR === f.path) resetView();
+      drawFolders();
+      // Python 那边也要同步删, 否则它还留着这个路径, 再加回来会被当成"已存在"
+      try { await api.remove_folder(f.path); } catch(e){}
+    };
+    box.appendChild(d);
+  });
+  updateRun();
+}
+
+function updateRun(){
+  // 分析过的文件夹(ok/err)也可以再分析一遍, 所以不只数 wait
+  var canRun = FOLDERS.some(function(f){ return f.state !== 'run'; });
+  $('bRun').disabled = RUNNING || !canRun;
+  $('bCancel').style.display = RUNNING ? '' : 'none';
+  $('bCancel').disabled = !RUNNING;
+}
+
+function setState(path, st){
+  FOLDERS.forEach(function(f){ if (f.path === path) f.state = st; });
+  drawFolders();
+}
+
+$('bCancel').onclick = async function(){
+  if (!RUNNING) return;
+  if (!confirm('中止分析? 已经算出来的结果会一起丢掉, 文件夹会留在列表里, 可以直接重跑。')) return;
+  RUNNING = false;
+  updateRun();
+  $('status').textContent = '正在停止…';
+  // 结果和勾选清掉, 但 FOLDERS 保留 —— 直接再点「开始分析」就能重跑
+  SEL = {};
+  resetView();
+  $('scount').textContent = '0';
+  FOLDERS.forEach(function(f){ if (f.state === 'run') f.state = 'wait'; });
+  drawFolders();
+  say('正在停止后台任务…');
+  try {
+    // 后端最多要等当前这张算完 (约 0.3s) 才会真的停, 这里别无限等
+    await Promise.race([
+      api.cancel(),
+      new Promise(function(res){ setTimeout(res, 8000); })
+    ]);
+    say('已取消 — 文件夹还在, 可以直接再点「开始分析」');
+  } catch(e){
+    say('已发出取消请求, 但后台没回应: ' + e, true);
+  }
+};
+
+$('bPick').onclick = async function(){
+  if (RUNNING) return;
+  var dirs = [];
+  try {
+    dirs = await api.pick_folders();
+  } catch(e){
+    say('选文件夹失败: ' + e, true);
+    return;
+  }
+  if (!dirs || !dirs.length) return;
+
+  // **必须同步给 Python**, 否则 api.analyze() 看到的队列是空的, 会返回
+  // "先选一个照片文件夹", 而界面已经把文件夹标成"分析中"却永远等不到消息。
+  try {
+    await api.add_folders(dirs);
+  } catch(e){
+    say('加入队列失败: ' + e, true);
+    return;
+  }
+
+  var n = 0;
+  dirs.forEach(function(d){
+    if (FOLDERS.some(function(f){ return f.path === d; })) return;
+    FOLDERS.push({path: d, state: 'wait'});
+    n++;
+  });
+  drawFolders();
+  if (n) say('已加入 ' + n + ' 个文件夹, 点「开始分析」');
+};
+
+$('bRun').onclick = function(){
+  if (RUNNING) return;
+  // 全部标成 run, 这样之前分析过的文件夹也能重跑一遍
+  FOLDERS.forEach(function(f){ f.state = 'run'; });
+  RUNNING = true;
+  drawFolders();
+  updateRun();                    // 立刻刷新按钮, 别等第一条消息才显示取消
+  $('status').textContent = '正在分析…';
+  say('正在分析, 可以随时点「取消」');
+  api.analyze($('cFull').checked).then(function(r){
+    if (r && r.error) { RUNNING = false; say(r.error, true); updateRun(); }
+  }, function(e){
+    RUNNING = false;
+    say('启动分析失败: ' + e, true);
+    updateRun();
+  });
+};
+
+/* ================= 轮询进度 =================
+   轮询用递归 setTimeout 而不是 setInterval: 后一次一定等前一次回来才排下一次。
+   setInterval + async 回调会重入 —— pywebview 的 JS 侧按 valueId 存回调,
+   两个 poll() 撞在一起会互相覆盖回调, 消息进了错的任务, 状态就永远停在"分析中"。
+   附带好处: Python 卡住时只是进度不更新, 不会堆积请求。 */
+var pollTimer = null, pollStarted = false, pollMisses = 0;
+
+async function pollOnce(){
+  var msgs = null;
+  try {
+    if (api) msgs = await api.poll();
+  } catch(e){
+    msgs = null;
+  }
+  try {
+    if (msgs && msgs.length){
+      pollMisses = 0;
+      handleMsgs(msgs);
+    } else if (RUNNING){
+      // 收不到消息但显示在分析 —— 给个提示, 但别太早误报
+      // (第一个文件夹要 list + 起 4 个 worker, 前几秒没消息是正常的)
+      pollMisses++;
+      if (pollMisses === 60){     // 大约 12 秒
+        say('分析好像卡住了 (12 秒没有任何进度)。\n' +
+            '可以点「取消」重来; 若反复出现请关掉重开程序。', true);
+      }
+    }
+  } catch(e){
+    // 单条消息处理出错不能拖死整个轮询, 否则界面会永远停在"分析中"
+    say('界面更新出错: ' + e, true);
+  } finally {
+    pollTimer = setTimeout(pollOnce, 200);
+  }
+}
+
+function startPolling(){
+  if (pollStarted) return;          // pywebviewready 和 页面加载 都可能调到这里
+  pollStarted = true;
+  pollOnce();
+}
+
+function handleMsgs(msgs){
+  for (var i=0; i<msgs.length; i++){
+    var m = msgs[i];
+    if (m[0] === 'log') $('status').textContent = m[1];
+    else if (m[0] === 'done') { setState(m[1], 'ok'); openFolder(m[1]); }
+    else if (m[0] === 'error') {
+      // (文件夹, 错误说明) —— 只显示第一行, 完整 traceback 放到 title 里备查
+      var path = m[1][0], msg = String(m[1][1] || '');
+      var first = msg.split('\n').filter(function(s){ return s.trim(); })[0] || '未知错误';
+      setState(path, 'err');
+      var f = FOLDERS.filter(function(x){ return x.path === path; })[0];
+      if (f) f.err = msg;
+      say('「' + (f ? f.path.split(/[\\\/]/).pop() : path) + '」' + first, true);
+    }
+    else if (m[0] === 'cancelled') {
+      // 后台把没跑完的文件夹放回队列了, 这里把它们的状态改回"待分析"
+      (m[1] || []).forEach(function(p){
+        var f = FOLDERS.filter(function(x){ return x.path === p; })[0];
+        if (f && f.state === 'run') f.state = 'wait';
+      });
+      drawFolders();
+      RUNNING = false; updateRun();
+    }
+    else if (m[0] === 'idle') {
+      RUNNING = false;
+      // 刚取消完的话别把"已取消"覆盖成"全部完成"
+      if ($('status').textContent !== '正在停止…')
+        $('status').textContent = FOLDERS.length
+          ? '全部完成 — 在上面点文件夹可以来回切'
+          : '就绪 — 先选文件夹, 再点「开始分析」';
+      updateRun();
+    }
+  }
+}
+
+/* ================= 结果 ================= */
+function resetView(){
+  CUR = null; CARDS = []; OFF = 0; TOTAL = 0; MORE = false; LB = []; lbi = 0;
+  $('grid').innerHTML = '';
+  $('bar').style.display = 'none';
+  $('empty').style.display = '';
+  $('empty').textContent = '先在上面选一个照片文件夹, 然后点「开始分析」。';
+}
+
+async function openFolder(folder){
+  resetView();
+  CUR = folder;
+  $('empty').textContent = '正在载入…';
+  $('status').textContent = folder;
+  try {
+    var d = await api.get_batch(folder, 0);
+    applyBatch(d);
+  } catch(e){
+    $('empty').textContent = '载入失败: ' + e;
+  }
+}
+
+async function loadMore(){
+  if (!MORE || !CUR || LOADING) return;
+  LOADING = true;
+  try {
+    var d = await api.get_batch(CUR, OFF);
+    applyBatch(d, true);
+  } catch(e){ say('载入更多失败: ' + e, true); }
+  LOADING = false;
+}
+
+/* 滚到接近底部才要下一页 —— 不是一上来就把几千张全拉进来 */
+function maybeLoadMore(){
+  if (!MORE || LOADING) return;
+  var left = document.body.scrollHeight - (window.scrollY + window.innerHeight);
+  if (left < 1200) loadMore();
+}
+window.addEventListener('scroll', maybeLoadMore, {passive: true});
+
+function applyBatch(d, append){
+  if (!append){ CARDS = []; $('grid').innerHTML = ''; }
+  OFF = d.off + d.cards.length;
+  TOTAL = d.total;
+  MORE = d.more;
+
+  var frag = document.createDocumentFragment();
+  d.cards.forEach(function(c){ frag.appendChild(makeCard(c)); });
+  $('grid').appendChild(frag);
+
+  $('bar').style.display = '';
+  $('empty').style.display = TOTAL ? 'none' : '';
+
+  // AF 区域下拉只填一次
+  var sel = $('fArea');
+  if (sel.options.length <= 1){
+    (d.areas || []).forEach(function(a){
+      var o = document.createElement('option');
+      o.value = a; o.textContent = a;
+      sel.appendChild(o);
+    });
+  }
+  $('tcount').textContent = TOTAL;
+  $('status').textContent = d.folder + '  ·  ' + TOTAL + ' 张  ·  检出人脸 ' +
+    d.n_face + '  ·  可对比的相似帧 ' + d.n_dup + ' 组  ·  其中疑似模糊 ' + d.n_soft + ' 张';
+  applyFilter();
+}
+
+function makeCard(c){
+  var el = document.createElement('div');
+  el.className = 'card ' + c.cls;
+  el.dataset.sharp = c.sharp;
+  el.dataset.ratio = c.ratio_v;
+  el.dataset.best  = c.best;
+  el.dataset.multi = c.multi;
+  el.dataset.face  = c.face;
+  el.dataset.area  = c.area;
+  el.dataset.name  = c.name;
+
+  el.innerHTML =
+    '<div class="pick"><input type="checkbox" class="cb"></div>' +
+    '<img alt="">' +
+    '<div class="info">' +
+      (c.badge ? '<span class="badge"></span>' : '') +
+      '<div class="name"></div><div class="sc"></div><div class="meta"></div>' +
+    '</div>';
+
+  if (c.badge) el.querySelector('.badge').textContent = c.badge;
+  el.querySelector('.name').textContent = c.name;
+  el.querySelector('.sc').textContent = c.score + c.ratio;
+  el.querySelector('.meta').textContent = c.meta;
+
+  var img = el.querySelector('img');
+  img.src = c.thumb;
+  img.alt = c.name;
+  img.onclick = function(){ openLb(c.name); };
+
+  var cb = el.querySelector('.cb');
+  cb.checked = !!SEL[c.name];
+  cb.onchange = function(){ toggle(c.name, cb.checked, el); };
+
+  el.dataset.sel = cb.checked ? '1' : '0';
+  if (cb.checked) el.classList.add('sel');
+  return el;
+}
+
+/* 队列条上点已完成文件夹 -> 切回它 */
+document.querySelector('#folders').addEventListener('click', function(e){
+  var it = e.target.closest('.fitem');
+  if (!it || e.target.tagName === 'BUTTON') return;
+  var p = it.querySelector('.p').textContent;
+  if (it.classList.contains('ok')) openFolder(p);
+});
+
+/* ================= 筛选 ================= */
+function applyFilter(){
+  var sharp = $('fSharp').value, ratio = $('fRatio').value;
+  var best = $('fBest').checked, multi = $('fMulti').checked;
+  var face = $('fFace').value, area = $('fArea').value;
+  var vis = [];
+  document.querySelectorAll('.card').forEach(function(c){
+    var d = c.dataset, ok = true;
+    if (sharp !== '' && parseFloat(d.sharp) < parseFloat(sharp)) ok = false;
+    if (ok && ratio !== '' && parseFloat(d.ratio)*100 < parseFloat(ratio)) ok = false;
+    if (ok && best && d.best !== '1') ok = false;
+    if (ok && multi && d.multi !== '1') ok = false;
+    if (ok && face === '1' && d.face !== '1') ok = false;
+    if (ok && face === '0' && d.face !== '0') ok = false;
+    if (ok && area !== '' && d.area !== area) ok = false;
+    c.style.display = ok ? '' : 'none';
+    if (ok) vis.push(c.dataset.name);
+  });
+  $('vcount').textContent = vis.length;
+  LB = vis;
+  if (lbi >= LB.length) lbi = 0;
+  $('bMove').disabled = countSel() === 0;
+  maybeLoadMore();
+}
+
+['fSharp','fRatio','fBest','fMulti','fFace','fArea'].forEach(function(id){
+  $(id).addEventListener('input', applyFilter);
+  $(id).addEventListener('change', applyFilter);
+});
+
+$('bReset').onclick = function(){
+  $('fSharp').value=''; $('fRatio').value='';
+  $('fBest').checked=false; $('fMulti').checked=false;
+  $('fFace').value=''; $('fArea').value='';
+  applyFilter();
+};
+
+/* ================= 勾选 ================= */
+function countSel(){ var n=0; for (var k in SEL) if (SEL[k]) n++; return n; }
+function selNames(){ return Object.keys(SEL).filter(function(k){ return SEL[k]; }); }
+
+function toggle(name, on, el){
+  SEL[name] = on;
+  if (on) el.classList.add('sel'); else el.classList.remove('sel');
+  $('scount').textContent = countSel();
+  $('bMove').disabled = countSel() === 0;
+}
+
+$('bAll').onclick = function(){
+  document.querySelectorAll('.card').forEach(function(c){
+    if (c.style.display === 'none') return;
+    var cb = c.querySelector('.cb');
+    cb.checked = true;
+    toggle(c.dataset.name, true, c);
+  });
+};
+$('bNone').onclick = function(){
+  document.querySelectorAll('.card').forEach(function(c){
+    var cb = c.querySelector('.cb');
+    cb.checked = false; toggle(c.dataset.name, false, c);
+  });
+};
+$('bInv').onclick = function(){
+  document.querySelectorAll('.card').forEach(function(c){
+    if (c.style.display === 'none') return;
+    var cb = c.querySelector('.cb');
+    cb.checked = !cb.checked;
+    toggle(c.dataset.name, cb.checked, c);
+  });
+};
+
+/* ================= 大图 ================= */
+var lbBusy = false;
+async function openLb(name){
+  LB = LB.length ? LB : visNames();
+  lbi = LB.indexOf(name);
+  if (lbi < 0) lbi = 0;
+  $('lb').style.display = 'flex';
+  await showLb();
+}
+
+function visNames(){
+  var a = [];
+  document.querySelectorAll('.card').forEach(function(c){
+    if (c.style.display !== 'none') a.push(c.dataset.name);
+  });
+  return a;
+}
+
+async function showLb(){
+  if (!LB.length) return;
+  var name = LB[lbi];
+  if (!name) return;
+  $('lbName').textContent = name;
+  $('lbImg').src = '';
+  if (lbBusy) return;
+  lbBusy = true;
+  try {
+    var r = await api.get_big(CUR, name);
+    if (r && r.error){ $('lbImg').alt = r.error; }
+    else if (r && r.img){ $('lbImg').src = r.img; }
+  } catch(e){ $('lbImg').alt = String(e); }
+  lbBusy = false;
+}
+
+function navLb(d){
+  if (!LB.length) return;
+  lbi = (lbi + d + LB.length) % LB.length;
+  showLb();
+}
+$('navL').onclick = function(){ navLb(-1); };
+$('navR').onclick = function(){ navLb(1); };
+$('lb').addEventListener('click', function(e){ if (e.target === $('lb')) $('lb').style.display='none'; });
+$('lbOrig').onclick = async function(){
+  var r = await api.show_in_explorer(CUR, LB[lbi]);
+  if (r && !r.ok) say(r.error, true);
+  return false;
+};
+document.addEventListener('keydown', function(e){
+  if ($('lb').style.display !== 'flex') return;
+  if (e.key === 'Escape') $('lb').style.display = 'none';
+  else if (e.key === 'ArrowRight') navLb(1);
+  else if (e.key === 'ArrowLeft') navLb(-1);
+});
+
+/* ================= 移动 / 导出 ================= */
+$('bDest').onclick = async function(){
+  var d = await api.pick_dest();
+  if (d) $('dest').value = d;
+};
+
+$('cPrev').onchange = function(){
+  var on = this.checked;
+  $('prevDir').disabled = !on;
+  $('bPrevDir').disabled = !on;
+  if (on && !$('prevDir').value){
+    // 默认放在目标文件夹旁边的 预览图 子目录里
+    var d = $('dest').value.trim();
+    if (d) $('prevDir').value = d.replace(/[\\\/]+$/, '') + '\\预览图';
+  }
+};
+
+$('bPrevDir').onclick = async function(){
+  var d = await api.pick_dest();
+  if (d) $('prevDir').value = d;
+};
+
+$('bMove').onclick = async function(){
+  var names = selNames();
+  var dest = $('dest').value.trim();
+  var copy = $('cCopy').checked;
+  var prevDir = $('cPrev').checked ? $('prevDir').value.trim() : '';
+  if (!names.length) return say('还没有勾选照片', true);
+  if (!dest) return say('先点「选择目标…」', true);
+  if ($('cPrev').checked && !prevDir) return say('勾了生成预览, 但没选预览目录', true);
+  var msg = '即将' + (copy ? '复制' : '移动') + ' ' + names.length + ' 张到:\n\n' + dest;
+  if (prevDir) msg += '\n\n同时生成 ' + names.length + ' 张预览 jpg (长边 1600) 到:\n' + prevDir;
+  msg += '\n\n同名 .xmp/.acr 会一起带走; 目标已有同名文件会跳过, 不覆盖。\n\n确定继续?';
+  if (!confirm(msg)) return;
+  say(prevDir ? '正在生成预览图并搬运…' : '正在处理…');
+  try {
+    var r = await api.move(CUR, names, dest, copy, false, prevDir);
+    if (r && r.error) say(r.error, true);
+    else if (r && r.ok) say(r.msg + '  (' + r.mb + ' MB)');
+    else say('有 ' + r.failed + ' 个文件失败', true);
+  } catch(e){ say('移动失败: ' + e, true); }
+};
+
+$('bExpCsv').onclick = async function(){
+  if (!CUR) return;
+  var r = await api.export_csv(CUR);
+  if (r && r.cancelled) return;
+  if (r && r.ok) say('已导出: ' + r.path);
+  else say((r && r.error) || '导出失败', true);
+};
+
+$('bExpList').onclick = async function(){
+  var names = selNames();
+  if (!names.length) return say('还没有勾选照片', true);
+  var r = await api.export_list(CUR, names);
+  if (r && r.cancelled) return;
+  if (r && r.ok) say('已导出 ' + r.n + ' 个文件名: ' + r.path);
+  else say((r && r.error) || '导出失败', true);
+};
+
+/* pywebview 的桥比页面脚本晚一点就位, 装好了再启动轮询 */
+function waitApi(){
+  if (window.pywebview && window.pywebview.api){
+    api = window.pywebview.api;
+    syncQueue();
+    if (!pollStarted) startPolling();
+    return;
+  }
+  setTimeout(waitApi, 100);
+}
+
+/* 命令行带进来的文件夹是 Python 那边记住的, 这里拉一次显示出来 */
+async function syncQueue(){
+  try {
+    var q = await api.get_queue();
+    (q.queue || []).forEach(function(p){
+      if (!FOLDERS.some(function(f){ return f.path === p; }))
+        FOLDERS.push({path: p, state: 'wait'});
+    });
+    (q.done || []).forEach(function(p){
+      if (!FOLDERS.some(function(f){ return f.path === p; }))
+        FOLDERS.push({path: p, state: 'ok'});
+    });
+    drawFolders();
+  } catch(e){ /* 桥还没完全就位, 下次再试 */ }
+}
+window.addEventListener('pywebviewready', function(){ waitApi(); });
+waitApi();
+</script>
+</body></html>

@@ -1,0 +1,29 @@
+# ---- 打包产物 ----
+# 打包结果 (~180MB) 用 build.py 重新生成, 不进版本库
+dist/
+*.spec.bak
+
+# PyInstaller 的中间目录 (只会有 exe 没有 _internal 的空壳, 很容易被误当成成品)
+_build/
+_build.log
+*.log
+
+# 虚拟环境, 由 README 里的命令重建
+venv/
+.venv/
+
+# 分析结果输出目录
+_cull_out/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
