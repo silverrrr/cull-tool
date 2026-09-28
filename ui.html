@@ -124,6 +124,7 @@
 
 <div id="bar" style="display:none">
   <div class="row">
+    <label>修图价值 &ge; <input type="number" id="fValue" min="0" max="100" step="5" placeholder="不限"></label>
     <label>眼部锐度 &ge; <input type="number" id="fSharp" step="50" placeholder="不限"></label>
     <label>组内占比 &ge; <input type="number" id="fRatio" min="0" max="100" step="5" placeholder="不限"> %</label>
     <label><input type="checkbox" id="fBest"> 只看组内胜出</label>
@@ -136,6 +137,7 @@
     <label>AF区域 <select id="fArea"><option value="">全部</option></select></label>
     <label>排序 <select id="fSort">
       <option value="sharp">按锐度 (默认)</option>
+      <option value="value">按修图价值</option>
       <option value="group">按分组, 同组放一起</option>
       <option value="name">按文件名, 同组放一起</option>
     </select></label>
@@ -169,7 +171,7 @@
   <span class="sw" style="background:#ff6040"></span>人脸框 &nbsp;&nbsp;
   <span class="sw" style="background:#00d2ff"></span>评分用的眼睛区域 &nbsp;&nbsp;
   <span class="sw" style="background:#00dc00"></span>相机设定的对焦点(仅 Flexible Spot)<br>
-  <b>重要</b>: 锐度是眼睛区域的梯度能量, 会受框景大小和光线影响, <b>只有同一组的帧之间比较才有意义</b>。
+  <b>重要</b>: 锐度是眼睛区域的梯度能量÷对比度 (已抵消阴影/欠曝), 但框景大小仍会带偏, <b>只有同一组的帧之间比较才有意义</b>。
   列表按锐度从高到低排, 从上往下扫即可。
 </div>
 
@@ -544,6 +546,7 @@ function makeCard(c){
   var el = document.createElement('div');
   el.className = 'card ' + c.cls;
   el.dataset.sharp = c.sharp;
+  el.dataset.value = (c.value == null ? '' : c.value);
   el.dataset.ratio = c.ratio_v;
   el.dataset.best  = c.best;
   el.dataset.multi = c.multi;
@@ -651,6 +654,7 @@ document.querySelector('#folders').addEventListener('click', function(e){
 
 /* ================= 筛选 ================= */
 function applyFilter(){
+  var value = $('fValue').value;
   var sharp = $('fSharp').value, ratio = $('fRatio').value;
   var best = $('fBest').checked, multi = $('fMulti').checked;
   var mface = $('fMultiFace').checked;
@@ -659,7 +663,8 @@ function applyFilter(){
   var vis = [];
   document.querySelectorAll('.card').forEach(function(c){
     var d = c.dataset, ok = true;
-    if (sharp !== '' && parseFloat(d.sharp) < parseFloat(sharp)) ok = false;
+    if (value !== '' && (d.value === '' || parseFloat(d.value) < parseFloat(value))) ok = false;
+    if (ok && sharp !== '' && parseFloat(d.sharp) < parseFloat(sharp)) ok = false;
     if (ok && ratio !== '' && parseFloat(d.ratio)*100 < parseFloat(ratio)) ok = false;
     if (ok && best && d.best !== '1') ok = false;
     if (ok && multi && d.multi !== '1') ok = false;
@@ -684,13 +689,13 @@ function applyFilter(){
   maybeLoadMore();
 }
 
-['fSharp','fRatio','fBest','fMulti','fMultiFace','fUncertain','fFace','fArea'].forEach(function(id){
+['fValue','fSharp','fRatio','fBest','fMulti','fMultiFace','fUncertain','fFace','fArea'].forEach(function(id){
   $(id).addEventListener('input', applyFilter);
   $(id).addEventListener('change', applyFilter);
 });
 
 $('bReset').onclick = function(){
-  $('fSharp').value=''; $('fRatio').value='';
+  $('fValue').value=''; $('fSharp').value=''; $('fRatio').value='';
   $('fBest').checked=false; $('fMulti').checked=false;
   $('fMultiFace').checked=false; $('fUncertain').checked=false;
   $('fFace').value=''; $('fArea').value='';

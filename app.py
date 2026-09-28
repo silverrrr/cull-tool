@@ -328,6 +328,10 @@ class Api:
                 out.extend(g)
             return out
 
+        if sort == "value":
+            return sorted(rows, key=lambda r: (r.get("edit_value") is None,
+                                               -(r.get("edit_value") or 0)))
+
         return sorted(rows, key=lambda r: (r.get("subject") != "face",
                                            -r.get("compare_value", 0)))
 
@@ -351,6 +355,12 @@ class Api:
             gs = r.get("group_size", 1)
             cards.append({
                 "name": r["file"],
+                "value": r.get("edit_value"),
+                "parts": r.get("score_parts") or {},
+                "yaw": r.get("yaw"),
+                "ear": r.get("ear"),
+                "mos_tech": r.get("mos_tech"),
+                "aes": r.get("aes"),
                 "thumb": r.get("_thumb") or "",
                 "group": r.get("group", 0),
                 "group_size": gs,
@@ -371,6 +381,7 @@ class Api:
                 "subject_idx": r.get("subject_idx", -1),
                 "face_metrics": (r.get("_face_metrics") or [])[:12],
                 "meta": " · ".join(x for x in [
+                    (f'修图价值 {r["edit_value"]:.0f}' if r.get("edit_value") is not None else ""),
                     f'组{r["group"]}({gs}张)' if gs > 1 else "",
                     "中央区(无脸)" if r.get("subject") == "center" else "眼睛对焦",
                     (f'主体脸 {r["face_w"]}px' if (r.get("faces") or 0) > 1

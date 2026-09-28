@@ -50,6 +50,9 @@ def main():
         # 都必须原样落在磁盘上, 混进 base_library.zip 会白屏
         '--collect-all', 'webview',
         '--collect-all', 'pythonnet',
+        # onnxruntime 的 capi dll / 各 provider 必须落在磁盘上, 不能只靠 hidden-import
+        '--collect-all', 'onnxruntime',
+        '--hidden-import', 'onnxruntime',
         '--hidden-import', 'rawpy',
         '--hidden-import', 'clr',
         '--exclude-module', 'matplotlib',

@@ -7,8 +7,9 @@
   大光圈人像的清晰度必须看「眼睛」, 不能看整幅画面。
   1. rawpy(libraw) 真正解码 RAW, 拿到原始像素
   2. OpenCV YuNet(轻量 CNN 人脸检测) 找脸, 并给出眼睛等 5 个关键点
-  3. 在眼睛位置的原始像素上算 Tenengrad 梯度能量 —— 合焦的眼睛边缘锐利,
-     跑焦的边缘被抹平, 这个指标会明显掉下来
+  3. 在眼睛位置的原始像素上算 Tenengrad 梯度能量, 再除以该区域的对比度做
+     归一化 —— 合焦的眼睛边缘锐利、得分高, 跑焦的边缘被抹平、得分低;
+     除以对比度是为了抵消阴影/欠曝的影响
   4. 把「脸的位置 + 脸的大小 + 焦距」相近的帧归为一组 (同一姿势的连拍),
      只在组内比较锐度 —— 不同距离/焦段的照片锐度本来就没有可比性
   5. 输出: CSV + 可视化 HTML(带人脸框和眼睛标记) + 组内最佳清单 + 疑似模糊清单
@@ -23,7 +24,7 @@
 import argparse
 import base64
 import csv
-import hashlib
+import datetime
 import html
 import io
 import itertools
@@ -64,11 +65,73 @@ EXIF_TAGS = {
 
 
 # ==========================================================================
-# 模型 / 中文路径
+# 模型下载 / 存放 / 中文路径
+#
+# 模型统一放在 exe 同级的 _internal\models\ (打包后 sys._MEIPASS 指向 _internal;
+# 源码运行则是工具目录下的 models\)。首次运行按需下载, 之后纯离线。
+# 可用 cull_config.json 的 model_dir / CLI --model 覆盖。
 # ==========================================================================
+LMK_URL = ("https://huggingface.co/public-data/insightface/resolve/main/"
+           "models/buffalo_l/2d106det.onnx")
+MUSIQ_ONNX_URL = ("https://huggingface.co/86Cao/IQA-ONNX-Models/resolve/main/musiq_model.onnx")
+MUSIQ_DATA_URL = ("https://huggingface.co/86Cao/IQA-ONNX-Models/resolve/main/"
+                  "musiq_model.onnx.data")
+NIMA_URL = ("https://huggingface.co/cromsc/nima-mobilenet-aesthetic/resolve/main/"
+            "nima_mobilenet_aesthetic.onnx")
+
+# name -> [(文件名, url, 最小字节)]。musiq 用外部数据格式(.onnx + .onnx.data), 两个都要下。
+ASSETS = {
+    "yunet": [(YUNET_NAME, YUNET_URL, 100_000)],
+    "landmark": [("2d106det.onnx", LMK_URL, 3_000_000)],
+    "musiq": [("musiq_model.onnx", MUSIQ_ONNX_URL, 500_000),
+              ("musiq_model.onnx.data", MUSIQ_DATA_URL, 50_000_000)],
+    "nima": [("nima_mobilenet_aesthetic.onnx", NIMA_URL, 10_000_000)],
+}
+
+# 默认配置 (可被 cull_config.json 覆盖)
+DEFAULT_CFG = {
+    "model_dir": None,                       # 覆盖模型存放目录
+    "enable": {"landmark": True, "musiq": True, "nima": True},
+    "weights": {"sharp": 0.30, "tech": 0.20, "pose": 0.20, "expr": 0.15, "aes": 0.15},
+}
+_CFG = json.loads(json.dumps(DEFAULT_CFG))   # 深拷贝
+
+
+def load_config():
+    """读工具目录/exe 同级的 cull_config.json, 覆盖到 _CFG 上。没有就用默认。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(base, os.pardir, "cull_config.json"),
+                 os.path.join(base, "cull_config.json")):
+        if os.path.isfile(cand):
+            try:
+                with open(cand, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+                for k, v in cfg.items():
+                    if isinstance(v, dict) and isinstance(_CFG.get(k), dict):
+                        _CFG[k].update(v)
+                    else:
+                        _CFG[k] = v
+                break
+            except Exception:                                # noqa: BLE001
+                pass
+    return _CFG
+
+
+def model_dir():
+    """模型目录: 打包后 = exe 同级 _internal\\models; 源码 = 工具目录\\models。"""
+    d = _CFG.get("model_dir")
+    if not d:
+        base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+        d = os.path.join(base, "models")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
 def _ascii_dir():
-    """OpenCV 在 Windows 下打不开含中文路径的文件, 模型要放到纯英文目录。"""
-    import tempfile
+    """OpenCV 在 Windows 下打不开含中文路径的文件 —— 镜像到这里再加载。"""
     for cand in (os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "cmdc_cull"),
                  os.path.join(tempfile.gettempdir(), "cmdc_cull")):
         try:
@@ -80,26 +143,138 @@ def _ascii_dir():
     return None
 
 
-def ensure_model(path=None):
-    if path and os.path.isfile(path):
+def ensure_asset(key):
+    """按需下载某组模型文件, 返回主模型路径。失败抛 RuntimeError。"""
+    d = model_dir()
+    first = None
+    for fname, url, min_size in ASSETS[key]:
+        dst = os.path.join(d, fname)
+        if not os.path.isfile(dst) or os.path.getsize(dst) < min_size:
+            print(f"首次运行: 下载模型 {fname} ...")
+            try:
+                urllib.request.urlretrieve(url, dst)
+            except Exception as exc:                         # noqa: BLE001
+                raise RuntimeError(
+                    f"模型下载失败 ({fname}): {exc}\n"
+                    f"可手动下载后放到 {os.path.join(d, fname)}, "
+                    f"或用 cull_config.json 的 model_dir 指定目录") from exc
+        if first is None:
+            first = dst
+    return first
+
+
+def _opencv_loadable(path):
+    """OpenCV 在 Windows 下打不开含中文的路径 —— 非 ASCII 时镜像到英文临时目录。"""
+    try:
+        path.encode("ascii")
         return path
+    except UnicodeEncodeError:
+        pass
     d = _ascii_dir()
     if not d:
-        sys.exit("找不到可写的纯英文目录, 请用 --model 指定 YuNet 模型路径")
-    dst = os.path.join(d, YUNET_NAME)
-    if not os.path.isfile(dst) or os.path.getsize(dst) < 100_000:
-        print(f"首次运行: 下载人脸检测模型 ({YUNET_NAME}) ...")
-        try:
-            urllib.request.urlretrieve(YUNET_URL, dst)
-        except Exception as exc:                             # noqa: BLE001
-            sys.exit(f"模型下载失败: {exc}\n可以手动下载后放到 {dst} 或用 --model 指定位置")
-    return dst
+        return path
+    mirror = os.path.join(d, os.path.basename(path))
+    try:
+        if not os.path.isfile(mirror) or os.path.getsize(mirror) != os.path.getsize(path):
+            shutil.copy2(path, mirror)
+    except OSError:
+        return path
+    return mirror
+
+
+def ensure_model(path=None):
+    """YuNet 检测模型。--model 指定就用它, 否则按需下载到 model_dir。"""
+    if path and os.path.isfile(path):
+        return _opencv_loadable(path)
+    return _opencv_loadable(ensure_asset("yunet"))
 
 
 def make_detector(model_path, score_thr=0.6):
     return cv2.FaceDetectorYN.create(model_path, "", (320, 320),
                                      score_threshold=score_thr,
                                      nms_threshold=0.3, top_k=5000)
+
+
+# ==========================================================================
+# 关键点 / 头部姿态 / 睁眼 / 画质 / 美感   (onnxruntime)
+# ==========================================================================
+def make_ort_session(path):
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 1     # 和 OpenCV 同理: 多进程时别开满线程抢核
+    so.inter_op_num_threads = 1
+    so.log_severity_level = 3
+    return ort.InferenceSession(path, sess_options=so, providers=["CPUExecutionProvider"])
+
+
+def detect_landmarks(bgr, box, sess):
+    """insightface 2d106det: 192x192 裁剪 (scale=192/(max(w,h)*1.5)), (x-127.5)/128。
+
+    返回 106x2 的关键点 (原图坐标)。
+    """
+    x0, y0, bw, bh = box
+    cx, cy = x0 + bw / 2.0, y0 + bh / 2.0
+    m = max(bw, bh, 1.0)
+    s = 192.0 / (m * 1.5)
+    M = np.array([[s, 0, -cx * s + 96.0], [0, s, -cy * s + 96.0]], np.float32)
+    aimg = cv2.warpAffine(bgr, M, (192, 192), borderValue=0)
+    blob = cv2.dnn.blobFromImage(aimg, 1.0 / 128.0, (192, 192),
+                                 (127.5, 127.5, 127.5), swapRB=True)
+    pred = sess.run(None, {sess.get_inputs()[0].name: blob})[0][0].reshape(-1, 2)
+    pred = (pred + 1.0) * 96.0
+    IM = cv2.invertAffineTransform(M)                    # 2x3, 把裁剪坐标映射回原图
+    return pred @ IM[:, :2].T + IM[:, 2]
+
+
+def eye_metrics(pts, lms, k=10):
+    """算 (睁眼程度 EAR, 偏航估计 yaw°)。
+
+    不用固定的 106 索引表 —— 取 106 点里离 YuNet 眼点最近的 k 个当眼周轮廓:
+      - EAR = 眼高 / 眼宽, 两眼取小 (眨眼会让它掉下来)
+      - yaw: 侧脸时远侧眼被压缩, 两眼投影宽度之比 ≈ cos(yaw) → yaw = acos(比值)。
+        比 5 点 solvePnP 稳得多 (后者在近平面点上会给出 -170° 这种离谱值)。
+    """
+    ears, widths = [], []
+    for eye in (lms[0], lms[1]):
+        d = np.linalg.norm(pts - eye, axis=1)
+        sel = pts[np.argsort(d)[:k]]
+        w = float(sel[:, 0].max() - sel[:, 0].min()) + 1e-6
+        widths.append(w)
+        bins = np.linspace(sel[:, 0].min(), sel[:, 0].max(), 5)
+        ups, lows = [], []
+        for i in range(4):
+            m = (sel[:, 0] >= bins[i]) & (sel[:, 0] <= bins[i + 1])
+            if m.any():
+                ups.append(sel[m][:, 1].min())
+                lows.append(sel[m][:, 1].max())
+        if ups:
+            ears.append(float(np.mean(np.array(lows) - np.array(ups))) / w)
+    ear = min(ears) if ears else None
+    wr = min(widths) / max(widths) if max(widths) > 0 else 1.0
+    # 实测: 正面 wr≈0.90, 3/4≈0.55, 侧脸≈0.40。线性映射到 0~75°, 不做 acos
+    # (acos 会把正面的 0.90 也算成 26°, 系统性抬高)。
+    yaw = 75.0 * max(0.0, min(1.0, (0.90 - wr) / 0.55))
+    return ear, yaw
+
+
+def tech_quality(bgr, sess):
+    """MUSIQ 技术画质 (0~100)。输入 224x224, 归一化 (x-0.5)/0.5。"""
+    x = cv2.resize(bgr, (224, 224), interpolation=cv2.INTER_AREA)
+    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    x = ((x - 0.5) / 0.5).transpose(2, 0, 1)[np.newaxis]
+    out = sess.run(None, {sess.get_inputs()[0].name: x.astype(np.float32)})[0]
+    return float(np.asarray(out).ravel()[0])
+
+
+def aesthetic_score(bgr, sess):
+    """NIMA 美感 (1~10): 输出 10 个 bin 的概率, 取期望值。"""
+    x = cv2.resize(bgr, (224, 224), interpolation=cv2.INTER_AREA)
+    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    out = sess.run(None, {sess.get_inputs()[0].name: x[np.newaxis].astype(np.float32)})[0][0]
+    return float((np.arange(1, 11) * out).sum())
+
+
+load_config()
 
 
 # ==========================================================================
@@ -430,6 +605,15 @@ def worker_init(model_path, full, preview_dir=None, preview_side=2048, cv_thread
     _W["full"] = full
     _W["preview_dir"] = preview_dir
     _W["preview_side"] = preview_side
+    # 关键点 / 画质 / 美感 三组 onnx 会话。缺模型不影响锐度主流程, 只是该项跳过。
+    en = _CFG.get("enable", {})
+    for key, sk in (("landmark", "lmk"), ("musiq", "musiq"), ("nima", "nima")):
+        _W[sk] = None
+        if en.get(key, True):
+            try:
+                _W[sk] = make_ort_session(ensure_asset(key))
+            except Exception as exc:                         # noqa: BLE001
+                print(f"  [!] {key} 模型不可用, 该项跳过 ({exc})")
 
 
 def process_one(name, folder):
@@ -455,7 +639,9 @@ def process_one(name, folder):
                     "faces": 0, "_thumb": "", "preview_rel": "", "_face_box": None,
                     "_eye_boxes": [], "sig": None, "_face_boxes": [],
                     "face_w": 0, "face_cx": 0, "face_cy": 0, "face_area_pct": 0,
-                    "face_conf": 0, "brightness": 0, "clipped": 0, "decoded": "", "_ms": 0})
+                    "face_conf": 0, "brightness": 0, "clipped": 0, "decoded": "", "_ms": 0,
+                    "yaw": None, "pitch": None, "roll": None, "ear": None,
+                    "mos_tech": None, "aes": None})
     try:
         rec.update(read_exif(path))
     except Exception:                                       # noqa: BLE001
@@ -510,29 +696,71 @@ def face_signature(gray, box, size=64):
 # ==========================================================================
 # 单张分析
 # ==========================================================================
-def measure_face(gray, fx, fy, fw, fh, lms):
+PATCH_OUT = 96          # 归一化后的眼框边长 (px)
+
+
+def _norm_patch(gray, cx, cy, w, h, out):
+    """以 (cx,cy) 为中心取 w×h 的区域 (越界用边缘复制补齐), 重采样到 out×out。"""
+    H, W = gray.shape
+    x0, y0 = int(round(cx - w / 2.0)), int(round(cy - h / 2.0))
+    x1, y1 = int(round(cx + w / 2.0)), int(round(cy + h / 2.0))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    px0, py0 = max(0, -x0), max(0, -y0)
+    px1, py1 = max(0, x1 - W), max(0, y1 - H)
+    crop = gray[max(0, y0):min(H, y1), max(0, x0):min(W, x1)]
+    if crop.shape[0] < 6 or crop.shape[1] < 6:
+        return None
+    if px0 or py0 or px1 or py1:
+        crop = cv2.copyMakeBorder(crop, py0, py1, px0, px1, cv2.BORDER_REPLICATE)
+    interp = cv2.INTER_AREA if max(crop.shape[:2]) > out else cv2.INTER_LINEAR
+    return cv2.resize(crop, (out, out), interpolation=interp)
+
+
+def _ten_patch(patch):
+    """固定尺寸 patch 上的 (Tenengrad 均值, 对比度 std)。"""
+    c = cv2.GaussianBlur(patch, (0, 0), 1.0)
+    return float(tenengrad_map(c).mean()), float(patch.std())
+
+
+def measure_face(gray, fx, fy, fw, fh, lms, yaw=0.0):
     """量一张脸的眼部锐度。返回 (eye_sharp, eye_boxes)。
 
     这是选脸和"手动换主体"共用的唯一口径 —— 两者必须算得一模一样,
     否则用户手动换了主体, 分数却对不上。
+
+    锐度 = Tenengrad 均值 ÷ 对比度, 且做了三重归一化:
+      1. **尺度**: 眼框尺寸按瞳距取 (0.70×瞳距), 再重采样到固定 PATCH_OUT px,
+         消除"框景大小"导致的像素数差异 (远景小脸 vs 近景大脸)
+      2. **朝向**: 按 1/cos(yaw) 横向多取样, 抵消侧脸时远侧眼被压缩 —— 修掉
+         "3/4 侧脸明明合焦却被评低分"
+      3. **对比度**: ÷ crop.std(), 抵消阴影/欠曝 (v3)
     """
-    er = max(10.0, fw * 0.24)
+    iod = float(np.hypot(*(lms[0] - lms[1])))
+    if not (iod > 6):
+        iod = max(8.0, fw * 0.5)
+    side = max(12.0, 0.70 * iod)                     # 眼框物理尺寸 ∝ 瞳距
+    cyaw = math.cos(math.radians(min(50.0, abs(yaw))))
+    sx = side / max(0.65, cyaw)                      # 横向多取样, 抵消侧脸的压缩
     eyes = []
     for ex, ey in (lms[0], lms[1]):
-        t, _c = patch_sharpness(gray, ex, ey, er)
-        if t > 0:
-            eyes.append(t)
+        p = _norm_patch(gray, ex, ey, sx, side, PATCH_OUT)
+        if p is not None:
+            t, c = _ten_patch(p)
+            if t > 0:
+                eyes.append(t / (c + 1.0))
     eye = float(np.mean(eyes)) if eyes else 0.0
-    boxes = [[int(ex - er), int(ey - er), int(2 * er), int(2 * er)]
+    er = side / 2.0
+    boxes = [[int(ex - er), int(ey - er), int(side), int(side)]
              for ex, ey in (lms[0], lms[1])]
     return eye, boxes
 
 
-def pick_subject(gray, faces, inv, W, H):
-    """遍历所有脸量眼部锐度, 返回 (best, all_boxes, all_metrics)。
+def pick_subject(gray, faces, inv, W, H, bgr=None, lmk=None):
+    """遍历所有脸: 关键点 → 姿态/睁眼 → 眼部锐度(尺度+朝向归一化)。
 
-    best 是个 dict: {eye, fx, fy, fw, fh, lms, conf, er, eye_boxes, idx}
-    all_metrics 是每张脸的摘要, 供界面列出来让你手动选。
+    返回 (best, all_boxes, all_metrics)。best 多带 yaw/pitch/roll/ear/idx。
+    bgr+lmk 给了就顺便算姿态和睁眼; 没有(或模型缺失)则 yaw=0、ear=None。
     """
     best = None
     all_boxes = []
@@ -541,18 +769,28 @@ def pick_subject(gray, faces, inv, W, H):
         fx, fy, fw, fh = [float(v) * inv for v in f[:4]]
         lms = (f[4:14].reshape(5, 2) * inv)
         conf = float(f[-1])
+        yaw = pitch = roll = ear = None
+        if bgr is not None and lmk is not None:
+            try:
+                lpts = detect_landmarks(bgr, (fx, fy, fw, fh), lmk)
+                ear, yaw = eye_metrics(lpts, lms)
+            except Exception:                                # noqa: BLE001
+                pass
         # numpy 标量 (np.float32) 不能 json 序列化, 而 face_cx/face_cy/
         # face_area_pct 都由它们算出来 —— 不先转成 python float 的话
         # write_cache() 会对每一张都静默失败。这里统一转掉。
-        eye, eboxes = measure_face(gray, fx, fy, fw, fh, lms)
+        eye, eboxes = measure_face(gray, fx, fy, fw, fh, lms, yaw or 0.0)
         all_boxes.append([int(fx), int(fy), int(fw), int(fh)])
         metrics.append({"idx": idx, "eye": round(eye, 1), "w": int(fw),
                         "cx": round((fx + fw / 2) / W, 4),
                         "cy": round((fy + fh / 2) / H, 4),
-                        "conf": round(conf, 2)})
+                        "conf": round(conf, 2),
+                        "yaw": round(yaw, 1) if yaw is not None else None,
+                        "ear": round(ear, 3) if ear is not None else None})
         cand = {"eye": eye, "fx": fx, "fy": fy, "fw": fw, "fh": fh,
                 "lms": lms, "conf": conf, "er": max(10.0, fw * 0.24),
-                "eye_boxes": eboxes, "idx": idx}
+                "eye_boxes": eboxes, "idx": idx,
+                "yaw": yaw, "pitch": pitch, "roll": roll, "ear": ear}
         if best is None or cand["eye"] > best["eye"]:
             best = cand
     return best, all_boxes, metrics
@@ -632,7 +870,8 @@ def analyze(path, detector, full=False, af_point=None, preview_path=None, previe
         # 而合影里主角的脸往往不是最大的 (大的是前排路人), 于是系统性选错主体。
         # 现在逐张脸算眼部锐度, 取最清楚的那张当主体;
         # 用户也可以在界面上手动换 (见 Api.set_subject)。
-        best, all_face_boxes, face_metrics = pick_subject(gray, faces, inv, W, H)
+        best, all_face_boxes, face_metrics = pick_subject(gray, faces, inv, W, H,
+                                                          bgr=bgr, lmk=_W.get("lmk"))
         eye_sharp, fx, fy, fw, fh = best["eye"], best["fx"], best["fy"], best["fw"], best["fh"]
         lms, conf, er, eboxes = (best["lms"], best["conf"], best["er"],
                                  best["eye_boxes"])
@@ -654,6 +893,10 @@ def analyze(path, detector, full=False, af_point=None, preview_path=None, previe
             "_face_boxes": all_face_boxes,
             "_face_metrics": face_metrics,
             "subject_idx": best["idx"],
+            "yaw": round(best["yaw"], 1) if best.get("yaw") is not None else None,
+            "pitch": round(best["pitch"], 1) if best.get("pitch") is not None else None,
+            "roll": round(best["roll"], 1) if best.get("roll") is not None else None,
+            "ear": round(best["ear"], 3) if best.get("ear") is not None else None,
         })
         subject_label = "face"
         rec["compare_value"] = rec["eye_sharp"]
@@ -662,10 +905,29 @@ def analyze(path, detector, full=False, af_point=None, preview_path=None, previe
         rec.update({"eye_sharp": 0.0, "face_sharp": round(t, 1), "face_conf": 0.0,
                     "face_w": 0, "face_cx": 0.5, "face_cy": 0.45, "face_area_pct": 0,
                     "sig": None, "_face_box": None, "_eye_boxes": [],
-                    "_face_boxes": [], "_face_metrics": [], "subject_idx": -1})
-        rec["compare_value"] = rec["face_sharp"]
+                    "_face_boxes": [], "_face_metrics": [], "subject_idx": -1,
+                    "yaw": None, "pitch": None, "roll": None, "ear": None})
+        # 和眼部一样除以对比度, 否则无脸照片的 compare_value 还是原始梯度能量,
+        # 量级比归一化后的眼部锐度大一个数量级, 排序时会全被顶到最前面
+        rec["compare_value"] = round(t / (c + 1.0), 1)
 
     rec["subject"] = subject_label
+
+    # 技术画质 (MUSIQ 0~100) / 美感 (NIMA 1~10) —— 整图, 每张各跑一次。
+    # 模型缺失就留 None, 后面的子分数会按"该维度不参与"处理。
+    rec["mos_tech"] = None
+    rec["aes"] = None
+    if _W.get("musiq") is not None:
+        try:
+            rec["mos_tech"] = round(tech_quality(bgr, _W["musiq"]), 2)
+        except Exception:                                   # noqa: BLE001
+            pass
+    if _W.get("nima") is not None:
+        try:
+            rec["aes"] = round(aesthetic_score(bgr, _W["nima"]), 2)
+        except Exception:                                   # noqa: BLE001
+            pass
+
     g = cv2.GaussianBlur(gray, (0, 0), 1.0)
     rec["sharp_global"] = round(float(tenengrad_map(g).mean()), 1)
     rec["brightness"] = round(float(gray.mean()), 1)
@@ -722,10 +984,36 @@ def make_thumb(bgr, face_box, eye_boxes, af_point=None, max_w=360, quality=78,
 
 
 # ==========================================================================
-# 分组: 同姿势 / 同机位才算可比
+# 分组: 同一时刻的连拍才算可比 (时间窗 + 姿态)
 # ==========================================================================
 def ncc(a, b):
     return float(np.dot(a, b) / a.size)
+
+
+# 连拍窗口: 拍摄时间相隔不超过这么多秒的帧才可能归为一组。
+# 以前是**全局**两两比对 + 并查集传递闭包, "甲像乙、乙像丙"的链会一路滚雪球,
+# 实测把 2 小时里 254 张互不相关的照片并成一组 (主体脸中心横跨 0.34~0.68)。
+# 连拍本就是一串相隔几秒的照片, 把候选配对限制在时间邻域内, 既贴合作品语义,
+# 也天然掐断了跨时段的滚雪球。
+BURST_SECS = 30.0
+# 窗口内、位置和脸宽都吻合时允许的指纹下限。人走动/转头会让整脸指纹掉得很低
+# (实测同一段走位里相邻帧 NCC 只有 0.05), 这时主要靠"时间近 + 位置/脸宽吻合"
+# 判定同组, 指纹只用来挡住完全不相关的帧。
+BURST_NCC = 0.20
+# 连拍判据用的位置/脸宽容差: 比常规判据更严, 因为这里放宽了指纹门槛。
+BURST_POS_TOL = 0.06
+BURST_SIZE_TOL = 0.20
+
+
+def _row_time(r):
+    """EXIF 拍摄时间 -> datetime; 缺失或非法返回 None (退回按文件顺序近似)。"""
+    s = r.get("datetime_original")
+    if not s:
+        return None
+    try:
+        return datetime.datetime.strptime(s, "%Y:%m:%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
 
 
 def _same_pose(a, b, pos_tol, size_tol, ncc_min, focal_tol, iou_min=0.0):
@@ -747,28 +1035,43 @@ def _same_pose(a, b, pos_tol, size_tol, ncc_min, focal_tol, iou_min=0.0):
     return ncc(a["sig"], b["sig"]) >= ncc_min
 
 
-def group_frames(rows, pos_tol=0.12, size_tol=0.30, ncc_min=0.85, focal_tol=0.15,
-                 iou_min=0.0):
-    """把「同一个人的相近姿态」的帧归为一组, 只在组内比锐度。
+def _burst_same(a, b, pos_tol, size_tol, ncc_min):
+    """连拍窗口内的宽松判据: 位置/脸宽严格吻合 + 指纹不低于下限。
 
-    以前是贪心首次匹配: 每帧只跟它遇到的第一个代表比, 找到就 break。
-    两个问题: ①找到代表 b, 换个顺序可能就跟 c 去了, 结果不稳;
-    ②A~B 像、B~C 像但 A~C 不像时, C 进不了 A 那组, 链式相似被拆散。
-    现在改成**并查集**: 两两判相似后合并, 最后取连通分量, 天然是传递闭包。
-
-    阈值依据 (实测一批 25 张会议/合影照, 逐对 300 个组合, 并人工核对了
-    所有成组的照片对):
-      - 旧的 ncc_min=0.80 实测**一对都过不了**(最高才 0.794), 25 张全是单张组
-      - 一度调到 0.60 太松, 结果把**换了人**的帧并进同一组
-      - 逐对量下来: 正确的对 NCC=0.905, 错误的对是 0.847 和 0.633,
-        两边区间重叠, 位置差/脸宽差/Iou 全都分不开 (正确对的位置差 0.085
-        比错误对还大)。**唯一能干净切开的只有 NCC: >=0.85 时恰好只留下
-        正确的那一对**, 所以 0.85 是这批数据的实测分界。
-      - pos_tol 保留 0.12: 它挡的是"同一画面里不同的人", 仍是最有效的一道闸
-      - iou_min 预留给需要时再开 (默认 0)。实测正确对的 IoU 只有 0.00,
-        现在开会把真对也拆掉
+    整脸指纹对走动/转头很敏感 (实测同一段走位里相邻帧能掉到 0.05), 只在
+    "时间很近 + 位置几乎没动 + 脸一样大"时才放宽指纹门槛, 把同一串连拍收进
+    一组, 同时仍用指纹下限挡住画面里换人/换背景的情况。
     """
-    parent = list(range(len(rows)))
+    if abs(math.log2(max(a["face_w"], 1) / max(b["face_w"], 1))) > size_tol:
+        return False
+    if math.hypot(a["face_cx"] - b["face_cx"], a["face_cy"] - b["face_cy"]) > pos_tol:
+        return False
+    return ncc(a["sig"], b["sig"]) >= ncc_min
+
+
+def group_frames(rows, pos_tol=0.12, size_tol=0.30, ncc_min=0.85, focal_tol=0.15,
+                 iou_min=0.0, burst_secs=BURST_SECS, burst_ncc=BURST_NCC):
+    """把「同一时刻、同一个人的相近姿态」的帧归为一组, 只在组内比锐度。
+
+    并查集 (传递闭包), 但**候选配对被时间窗限制**: 只有拍摄时间相隔 <=
+    burst_secs 的帧才两两比对。这道限制是必需的 —— 纯全局闭包会滚雪球,
+    实测把 2 小时里 254 张不相关的照片并成一组。时间窗把分组锁在"连拍"邻域内。
+
+    每对被时间窗允许的帧, 判定分两级:
+      1. `_same_pose` 常规判据: 位置/脸宽/焦距/指纹 (ncc_min) 全过
+      2. `_burst_same` 连拍判据: 时间很近时位置/脸宽几乎没变就放宽指纹门槛,
+         用来把"人走动/转头导致整脸指纹掉下来"的同一串连拍收在一起
+
+    没有 EXIF 拍摄时间的帧退回按文件顺序的相邻 (|i-j|<=3) 兜底。
+
+    ncc_min 仍是实测分界 (一批 25 张会议/合影照逐对量出来 0.85: 正确的对
+    NCC=0.905, 错误的对是 0.847/0.633, 位置差和 IoU 全都分不开)。但那批数据
+    里每对都是"站着几乎不动", 一旦有人走动/转头整脸指纹就会掉到 0.2 以下,
+    这时要靠第 2 级判据兜底 —— ncc_min 是主判据, 不再是唯一判据。
+    pos_tol 保留 0.12: 它挡的是"同一画面里不同的人", 仍是最有效的一道闸。
+    """
+    n = len(rows)
+    parent = list(range(n))
 
     def find(i):
         while parent[i] != i:
@@ -781,12 +1084,22 @@ def group_frames(rows, pos_tol=0.12, size_tol=0.30, ncc_min=0.85, focal_tol=0.15
         if ri != rj:
             parent[max(ri, rj)] = min(ri, rj)
 
+    times = [_row_time(r) for r in rows]
     idx = [i for i, r in enumerate(rows)
            if r.get("subject") == "face" and r.get("sig") is not None]
     for i, j in itertools.combinations(idx, 2):
-        if _same_pose(rows[i], rows[j], pos_tol, size_tol, ncc_min,
-                      focal_tol, iou_min):
-            union(i, j)
+        a, b = rows[i], rows[j]
+        ta, tb = times[i], times[j]
+        if ta is not None and tb is not None:
+            if abs((ta - tb).total_seconds()) > burst_secs:
+                continue                          # 相隔太久, 不可能是同一串连拍
+            if _same_pose(a, b, pos_tol, size_tol, ncc_min, focal_tol, iou_min):
+                union(i, j)
+            elif _burst_same(a, b, BURST_POS_TOL, BURST_SIZE_TOL, burst_ncc):
+                union(i, j)
+        elif abs(i - j) <= 3:                     # 没时间戳, 退回按文件顺序相邻
+            if _same_pose(a, b, pos_tol, size_tol, ncc_min, focal_tol, iou_min):
+                union(i, j)
 
     buckets = {}
     for i, r in enumerate(rows):
@@ -1266,12 +1579,51 @@ def js_str_body(s):
 # ==========================================================================
 # 分组 + 生成全部报告文件 (命令行 main() 和 GUI app.py 共用)
 # ==========================================================================
-def compute_flags(rows, groups_ncc=0.85, soft_ratio=0.55):
+def _score_parts(r):
+    """把一张照片的原始测量折算成 0~1 的子分数 (缺的维度不放进来)。"""
+    p = {}
+    gs = r.get("group_size", 1)
+    cv = float(r.get("compare_value") or 0.0)
+    if gs > 1 and r.get("ratio_group"):
+        p["sharp"] = max(0.0, min(1.0, float(r["ratio_group"])))
+    else:
+        p["sharp"] = max(0.0, min(1.0, cv / 25.0))       # 单张: 绝对锐度的饱和映射
+    mt = r.get("mos_tech")
+    if mt is not None:
+        p["tech"] = max(0.0, min(1.0, float(mt) / 100.0))
+    yaw = r.get("yaw")
+    if yaw is not None:
+        ypen = max(0.0, (abs(float(yaw)) - 15.0) / 45.0)
+        ppen = max(0.0, (abs(float(r.get("pitch") or 0.0)) - 15.0) / 35.0)
+        p["pose"] = max(0.0, 1.0 - max(ypen, ppen))
+    ear = r.get("ear")
+    if ear is not None:
+        p["expr"] = max(0.0, min(1.0, (float(ear) - 0.08) / 0.17))   # <0.08 视为闭眼
+    aes = r.get("aes")
+    if aes is not None:
+        p["aes"] = max(0.0, min(1.0, (float(aes) - 1.0) / 9.0))
+    return p
+
+
+def edit_value_of(parts):
+    """按 _CFG 权重把子分数加权合成 0~100; 权重只在"有的维度"上归一化。"""
+    w = _CFG.get("weights", {})
+    num = den = 0.0
+    for k, s in parts.items():
+        wk = float(w.get(k, 0.0))
+        if wk > 0:
+            num += wk * s
+            den += wk
+    return round(100.0 * num / den, 1) if den > 0 else None
+
+
+def compute_flags(rows, groups_ncc=0.85, soft_ratio=0.55, group_window=BURST_SECS):
     """给 rows 打上分组/判定标记。纯计算, 不碰磁盘。
 
     GUI 直接调这个函数出结果, 不经过 write_reports —— 所以 exe 里不用写任何文件。
     """
-    groups = group_frames([r for r in rows if not r.get("_error")], ncc_min=groups_ncc)
+    groups = group_frames([r for r in rows if not r.get("_error")],
+                          ncc_min=groups_ncc, burst_secs=group_window)
     for gi, g in enumerate(groups, 1):
         g.sort(key=lambda r: -r["compare_value"])
         top = g[0]["compare_value"]
@@ -1296,6 +1648,12 @@ def compute_flags(rows, groups_ncc=0.85, soft_ratio=0.55):
         r.setdefault("soft", bool(r.get("_error")))
         r.setdefault("subject_uncertain", False)
 
+    # 修图价值: 各维度子分数 (0~1) + 加权合成 (0~100)
+    for r in rows:
+        parts = _score_parts(r)
+        r["score_parts"] = {k: round(v, 3) for k, v in parts.items()}
+        r["edit_value"] = None if r.get("_error") else edit_value_of(parts)
+
     return {
         "groups": groups,
         "n_soft": sum(1 for r in rows if r.get("soft")),
@@ -1306,8 +1664,11 @@ def compute_flags(rows, groups_ncc=0.85, soft_ratio=0.55):
 
 
 CSV_COLS = [("group", "组"), ("group_size", "组内张数"), ("best_in_group", "组内最佳"),
-            ("soft", "疑似模糊"), ("file", "文件名"), ("eye_sharp", "眼部锐度"),
-            ("ratio_group", "占组内最佳"), ("face_sharp", "脸部锐度"),
+            ("soft", "疑似模糊"), ("edit_value", "修图价值"), ("file", "文件名"),
+            ("eye_sharp", "眼部锐度"),
+            ("ratio_group", "占组内最佳"), ("yaw", "偏航°"), ("pitch", "俯仰°"),
+            ("ear", "睁眼"), ("mos_tech", "技术画质"), ("aes", "美感"),
+            ("face_sharp", "脸部锐度"),
             ("sharp_global", "全画面锐度"), ("subject", "对焦依据"), ("face_conf", "人脸置信"),
             ("face_w", "脸宽px"), ("face_area_pct", "脸占画面%"), ("faces", "人脸数"),
             ("focus_mode", "对焦模式"), ("af_area", "AF区域"), ("af_x", "AF点X"), ("af_y", "AF点Y"),
@@ -1349,10 +1710,16 @@ def write_csv(rows, path):
 # 存的必须是**原始测量值**, 不存 group/soft/best_in_group —— 那几个由
 # compute_flags() 纯计算得出, 存了反而会和 --group-ncc/--ratio 参数打架。
 # ==========================================================================
-CACHE_VERSION = 2          # 改测量逻辑就 +1, 旧缓存自动作废
+CACHE_VERSION = 4          # 改测量逻辑就 +1, 旧缓存自动作废
                             # v2: 选脸规则从"最大面积"改成"最清楚那张", sig 含义跟着变了
-CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
-                         "cmdc_cull", "cache")
+                            # v3: 眼部锐度改成对比度归一化 (除以眼部区域 std), 抵消阴影/欠曝
+                            # v4: 眼部锐度再按瞳距做尺度归一化 + 按 yaw 做朝向归一化;
+                            #     新增 yaw/pitch/roll/ear/mos_tech/aes 与修图价值分
+# 缓存就落在**照片文件夹里** (不再写 C 盘), 文件名固定。
+# 用固定名而不是"路径的 sha1": 缓存跟照片放一起, 文件夹整体拷贝/挪动后缓存也跟着走 ——
+# 但读回时校验 data["folder"] 必须等于当前文件夹, 所以换了路径会作废重扫, 不会串味。
+# 后缀是 .json, 不在 RAW_EXTS/IMG_EXTS 白名单里, list_photos() 不会把它当照片。
+CACHE_NAME = "_cull_cache.json"
 
 THUMB_PREFIX = "data:image/jpeg;base64,"
 
@@ -1363,7 +1730,8 @@ _CACHE_FIELDS = ("eye_sharp", "face_sharp", "sharp_global", "compare_value",
                  "subject", "faces", "face_conf", "face_w", "face_cx", "face_cy",
                  "face_area_pct", "brightness", "clipped", "decoded",
                  "from_preview", "_error", "_ms", "_face_boxes", "_face_box",
-                 "_eye_boxes", "_face_metrics", "subject_idx")
+                 "_eye_boxes", "_face_metrics", "subject_idx",
+                 "yaw", "pitch", "roll", "ear", "mos_tech", "aes")
 # EXIF: 这些原始值是 (分子, 分母) 元组, JSON 里要转成 list, 读回再转回 tuple
 _CACHE_RATIOS = ("exposure_time", "f_number", "focal_length")
 _CACHE_PLAIN = ("iso", "focus_mode", "af_area", "af_x", "af_y",
@@ -1371,9 +1739,8 @@ _CACHE_PLAIN = ("iso", "focus_mode", "af_area", "af_x", "af_y",
 
 
 def cache_path(folder):
-    """缓存文件名 = 路径的 sha1, 避开中文路径和 260 字符限制。"""
-    key = os.path.abspath(folder).lower().encode("utf-8")
-    return os.path.join(CACHE_DIR, hashlib.sha1(key).hexdigest()[:20] + ".json")
+    """缓存文件 = 照片文件夹里的 _cull_cache.json。"""
+    return os.path.join(os.path.abspath(folder), CACHE_NAME)
 
 
 def _enc_sig(sig):
@@ -1413,7 +1780,6 @@ def _dec_sig(b64):
 def write_cache(folder, rows, full, groups_ncc=0.85, soft_ratio=0.55):
     """把一轮分析结果落盘。失败不致命 —— 顶多下次重扫, 所以别向上抛。"""
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
         items = []
         for r in rows:
             try:
@@ -1507,33 +1873,24 @@ def read_cache(folder, full, names=None):
     return rows
 
 
-def clear_cache(folder=None):
-    """删掉某个文件夹的缓存; folder 为空则全删。返回删掉几个。"""
+def clear_cache(folder):
+    """删掉照片文件夹里的缓存文件 (含可能残留的 .tmp)。返回删掉几个。"""
     n = 0
     try:
-        if folder:
-            for p in (cache_path(folder), cache_path(folder) + ".tmp"):
-                if os.path.isfile(p):
-                    os.remove(p)
-                    n += 1
-            return n
-        if not os.path.isdir(CACHE_DIR):
-            return 0
-        for f in os.listdir(CACHE_DIR):
-            if f.endswith((".json", ".tmp")):
-                try:
-                    os.remove(os.path.join(CACHE_DIR, f))
-                    n += 1
-                except OSError:
-                    pass
-        return n
+        for p in (cache_path(folder), cache_path(folder) + ".tmp"):
+            if os.path.isfile(p):
+                os.remove(p)
+                n += 1
     except OSError:
-        return n
+        pass
+    return n
 
 
-def write_reports(rows, folder, out_dir, full=False, groups_ncc=0.85, soft_ratio=0.55):
+def write_reports(rows, folder, out_dir, full=False, groups_ncc=0.85, soft_ratio=0.55,
+                  group_window=BURST_SECS):
     """给 rows 打上分组/判定标记, 并写出 CSV / txt / HTML。返回统计数字。"""
-    st = compute_flags(rows, groups_ncc=groups_ncc, soft_ratio=soft_ratio)
+    st = compute_flags(rows, groups_ncc=groups_ncc, soft_ratio=soft_ratio,
+                       group_window=group_window)
     groups, n_soft, n_face, n_dup = st["groups"], st["n_soft"], st["n_face"], st["n_dup"]
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1558,7 +1915,7 @@ def write_reports(rows, folder, out_dir, full=False, groups_ncc=0.85, soft_ratio
                          f'{r["ratio_group"]:>5.0%}{mark}\n')
             fh.write("\n")
         fh.write("\n=== 单独的照片 (没有可比对对象, 锐度仅供参考) ===\n")
-        fh.write("(顺序 = 眼部锐度从高到低; 数值受框景/光线影响, 不要跨照片直接比)\n\n")
+        fh.write("(顺序 = 眼部锐度从高到低; 已按对比度归一化, 但框景大小仍会带偏, 不要跨照片直接比)\n\n")
         for r in sorted(singles, key=lambda r: -r["compare_value"]):
             extra = "  [无脸, 用中央区估算]" if r.get("subject") == "center" else ""
             fh.write(f'  {r["file"]:<16} 眼部锐度 {r["eye_sharp"]:>8}{extra}\n')
@@ -1627,8 +1984,8 @@ def write_reports(rows, folder, out_dir, full=False, groups_ncc=0.85, soft_ratio
               '<span class="sw" style="background:#ff6040"></span>人脸框 &nbsp;&nbsp;'
               '<span class="sw" style="background:#00d2ff"></span>评分用的眼睛区域 &nbsp;&nbsp;'
               '<span class="sw" style="background:#00dc00"></span>相机设定的对焦点(仅 Flexible Spot)<br>'
-              '<b>重要</b>: 锐度是眼睛区域的梯度能量, 会受框景大小和光线影响, '
-              '<b>只有同一组的帧之间比较才有意义</b>, 不要拿绝对值跨照片比。'
+              '<b>重要</b>: 锐度是眼睛区域的梯度能量÷对比度 (已抵消阴影/欠曝), '
+              '但框景大小仍会带偏, <b>只有同一组的帧之间比较才有意义</b>, 不要拿绝对值跨照片比。'
               '列表按锐度从高到低排, 从上往下扫即可。<br>'
               '<b>筛选说明</b>: "组内胜出"指同一组里最锐的那张(单张照片没得比, 不会出现在这个筛选里); '
               '"组内占比"只对多帧相似组有效, 单张视为通过。')
@@ -1666,9 +2023,13 @@ def main():
     ap.add_argument("--ext", default=None, help="扩展名, 逗号分隔 (默认 RAW, 自动跳过已有 RAW 的导出版)")
     ap.add_argument("--ratio", type=float, default=0.55, help="组内锐度低于最佳 x ratio 判为疑似模糊 (默认 0.55)")
     ap.add_argument("--group-ncc", type=float, default=0.85,
-                    help="相似帧分组的严格度 0~1 (默认 0.85; 这是实测能分开"
+                    help="相似帧分组的指纹严格度 0~1 (默认 0.85; 这是实测能分开"
                          "'同一个人'和'换了人'的分界, 调到 0.7~0.8 会把"
                          "不同的人并进一组)")
+    ap.add_argument("--group-window", type=float, default=BURST_SECS,
+                    help=f"连拍分组的时间窗, 单位秒 (默认 {BURST_SECS:g}; 只有拍摄时间"
+                         "相隔不超过这个值的帧才可能归为一组。设得越大越容易把"
+                         "不同时段的照片并进来, 也越容易出现跨时段的大组)")
     ap.add_argument("--full", action="store_true", help="全分辨率解码 (更准, 慢约 5 倍)")
     ap.add_argument("--model", default=None, help="YuNet 模型路径")
     ap.add_argument("--jobs", type=int, default=4,
@@ -1772,7 +2133,8 @@ def main():
     # ---- 分组 + 报告 ----
     groups, n_soft, n_face, n_dup = write_reports(rows, folder, out_dir,
                                                   full=args.full, groups_ncc=args.group_ncc,
-                                                  soft_ratio=args.ratio)
+                                                  soft_ratio=args.ratio,
+                                                  group_window=args.group_window)
     print(f"\n{len(rows)} 张 / {len(groups)} 组, 检出人脸 {n_face} 张, "
           f"可对比的相似帧 {n_dup} 组, 其中疑似模糊 {n_soft} 张")
     multi = sorted([g for g in groups if len(g) > 1], key=lambda g: -len(g))

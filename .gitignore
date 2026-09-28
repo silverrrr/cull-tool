@@ -15,6 +15,9 @@ venv/
 # 分析结果输出目录
 _cull_out/
 
+# 首次运行自动下载的模型 (~128MB): 关键点 / MUSIQ / NIMA
+models/
+
 # Python 缓存
 __pycache__/
 *.pyc
