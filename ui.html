@@ -46,7 +46,22 @@
   #dest{font-family:Consolas,monospace;font-size:12.5px}
 
   /* ---- 卡片 ---- */
-  #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px;align-items:start;padding:16px}
+  #grid{padding:4px 0 16px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px;
+         align-items:start;padding:0 16px}
+  /* 分节标题: 组与组之间的分隔条, 可折叠 */
+  .sec{margin-top:6px}
+  .sechead{display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none;
+           padding:9px 16px 7px;position:sticky;top:0;z-index:5;
+           background:rgba(24,24,27,.94);backdrop-filter:blur(6px)}
+  .sechead:hover{background:rgba(38,38,45,.96)}
+  .sechead .caret{display:inline-block;width:11px;color:#8f8f99;transition:transform .12s}
+  .sec.closed .caret{transform:rotate(-90deg)}
+  .sec.closed .cards{display:none}
+  .sechead .t{font-size:12.5px;color:#c9c9d2}
+  .sechead .n{font-size:11.5px;color:#8f8f99}
+  .sechead .tag{font-size:11px;padding:1px 7px;border-radius:99px;background:#3a3a42;color:#bbb}
+  .sechead .tag.warn{background:#8a6d1f;color:#ffe9a8}
   #empty{padding:70px 20px;text-align:center;color:#8f8f99}
   .card{background:#242429;border-radius:10px;overflow:hidden;border:2px solid transparent;position:relative}
   .card.soft{border-color:#c0392b}
@@ -60,6 +75,18 @@
   .sc{color:#7fd1a8}
   .card.soft .sc{color:#ff8a80}
   .meta{color:#8f8f99;font-size:11.5px;margin-top:3px}
+  .ops{margin-top:7px;display:flex;gap:6px}
+  .op{background:#2f2f37;color:#c9c9d2;border:1px solid #43434d;border-radius:5px;
+      padding:3px 8px;font:inherit;font-size:11.5px;cursor:pointer}
+  .op:hover{background:#3a3a45;color:#fff}
+  .op:active{background:#26262d}
+  .facepick{margin-top:7px;display:flex;align-items:center;gap:6px}
+  .facepick:empty{display:none}
+  .fplab{font-size:11.5px;color:#8f8f99;flex:0 0 auto}
+  .facepick select{background:#2a2a31;color:#ddd;border:1px solid #43434d;
+                   border-radius:5px;padding:2px 5px;font:inherit;font-size:11.5px;
+                   max-width:100%;cursor:pointer}
+  .facepick select:hover{background:#33333c}
   .badge{float:right;font-size:11px;padding:1px 7px;border-radius:99px;background:#3a3a42;color:#bbb;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .card.soft .badge{background:#c0392b;color:#fff}
   .card.best .badge{background:#27ae60;color:#062}
@@ -87,8 +114,9 @@
     <button id="bRun" disabled>2. 开始分析</button>
     <button id="bCancel" class="pri" style="display:none" disabled>取消</button>
     <label><input type="checkbox" id="cFull"> 全分辨率(慢一些)</label>
+    <label><input type="checkbox" id="cForce"> 忽略缓存重扫</label>
     <div class="sp"></div>
-    <span class="muted" style="font-size:12px">结果只在这个窗口里看, 不写任何文件</span>
+    <span class="muted" style="font-size:12px">结果只在这个窗口里看, 不写照片文件夹</span>
   </div>
   <div id="folders"></div>
   <div id="status">就绪 — 先选文件夹, 再点「开始分析」</div>
@@ -100,10 +128,17 @@
     <label>组内占比 &ge; <input type="number" id="fRatio" min="0" max="100" step="5" placeholder="不限"> %</label>
     <label><input type="checkbox" id="fBest"> 只看组内胜出</label>
     <label><input type="checkbox" id="fMulti"> 只看有可比对对象的组</label>
+    <label><input type="checkbox" id="fMultiFace"> 只看多脸</label>
+    <label><input type="checkbox" id="fUncertain"> 只看主体存疑 ⚠</label>
     <label>对焦依据
       <select id="fFace"><option value="">全部</option><option value="1">有人脸</option><option value="0">无脸</option></select>
     </label>
     <label>AF区域 <select id="fArea"><option value="">全部</option></select></label>
+    <label>排序 <select id="fSort">
+      <option value="sharp">按锐度 (默认)</option>
+      <option value="group">按分组, 同组放一起</option>
+      <option value="name">按文件名, 同组放一起</option>
+    </select></label>
     <button id="bReset">重置</button>
   </div>
   <div class="row" id="act">
@@ -144,7 +179,7 @@
 <div id="lb">
   <span class="nav" id="navL">&#10094;</span>
   <img id="lbImg" alt="">
-  <div class="lt"><span id="lbName"></span><a id="lbOrig">在资源管理器中显示原文件</a></div>
+  <div class="lt"><span id="lbName"></span><a id="lbOpen">用看图程序打开原图</a><a id="lbOrig">在资源管理器中显示原文件</a></div>
   <div class="hint">&#8592;/&#8594; 切换 &nbsp;&middot;&nbsp; Esc 关闭</div>
   <span class="nav" id="navR">&#10095;</span>
 </div>
@@ -161,6 +196,8 @@ var RUNNING = false;
 var OFF = 0, TOTAL = 0, MORE = false, LOADING = false;
 var LB = [];             // lightbox 列表 (当前可见的卡片)
 var lbi = 0;
+var SORTCUR = 'sharp';   // 排序: sharp | group | name
+var SECS = {};           // 分节折叠状态: secKey -> true(展开)/false(折叠)
 
 function $(id){ return document.getElementById(id); }
 
@@ -275,15 +312,30 @@ $('bRun').onclick = function(){
   RUNNING = true;
   drawFolders();
   updateRun();                    // 立刻刷新按钮, 别等第一条消息才显示取消
+  var force = $('cForce').checked;
   $('status').textContent = '正在分析…';
-  say('正在分析, 可以随时点「取消」');
-  api.analyze($('cFull').checked).then(function(r){
-    if (r && r.error) { RUNNING = false; say(r.error, true); updateRun(); }
+  say(force ? '正在强制重扫 (忽略缓存)…' : '正在分析, 可以随时点「取消」');
+  api.analyze($('cFull').checked, 4, force).then(function(r){
+    // 注意: analyze() 是 **resolve** 出 {ok:false, error} 而不是 reject,
+    // 所以这里必须把文件夹状态退回 'wait' —— 否则全都卡在 'run',
+    // updateRun() 会让「开始分析」一直禁用, 「取消」也点不动。
+    if (r && r.error) {
+      RUNNING = false;
+      FOLDERS.forEach(function(f){ if (f.state === 'run') f.state = 'wait'; });
+      drawFolders();
+      $('status').textContent = '就绪 — 先选文件夹, 再点「开始分析」';
+      say(r.error, true);
+      updateRun();
+    }
   }, function(e){
     RUNNING = false;
+    FOLDERS.forEach(function(f){ if (f.state === 'run') f.state = 'wait'; });
+    drawFolders();
     say('启动分析失败: ' + e, true);
     updateRun();
   });
+  // 强制重扫是一次性语义: 用完自动取消勾选, 免得下次误开又白扫一遍
+  if (force) $('cForce').checked = false;
 };
 
 /* ================= 轮询进度 =================
@@ -377,18 +429,25 @@ async function openFolder(folder){
   $('empty').textContent = '正在载入…';
   $('status').textContent = folder;
   try {
-    var d = await api.get_batch(folder, 0);
+    var d = await api.get_batch(folder, 0, 60, SORTCUR);
     applyBatch(d);
   } catch(e){
     $('empty').textContent = '载入失败: ' + e;
   }
 }
 
+/* 换排序要重新从头拉一遍 —— 后端是按 offset 分页的, 顺序变了不能续着接 */
+$('fSort').onchange = async function(){
+  SORTCUR = this.value;
+  if (CUR){ await openFolder(CUR); }
+  else { say('已切换排序, 打开一个文件夹后生效'); }
+};
+
 async function loadMore(){
   if (!MORE || !CUR || LOADING) return;
   LOADING = true;
   try {
-    var d = await api.get_batch(CUR, OFF);
+    var d = await api.get_batch(CUR, OFF, 60, SORTCUR);
     applyBatch(d, true);
   } catch(e){ say('载入更多失败: ' + e, true); }
   LOADING = false;
@@ -403,14 +462,65 @@ function maybeLoadMore(){
 window.addEventListener('scroll', maybeLoadMore, {passive: true});
 
 function applyBatch(d, append){
-  if (!append){ CARDS = []; $('grid').innerHTML = ''; }
+  if (!append){ CARDS = []; $('grid').innerHTML = ''; SECS = {}; }
   OFF = d.off + d.cards.length;
   TOTAL = d.total;
   MORE = d.more;
 
-  var frag = document.createDocumentFragment();
-  d.cards.forEach(function(c){ frag.appendChild(makeCard(c)); });
-  $('grid').appendChild(frag);
+  var cards = d.cards || [];
+  if (SORTCUR === 'sharp'){
+    // 不分节: 沿用以前的平铺网格
+    var box = $('grid');
+    if (!append){
+      box.innerHTML = '';
+      var g = document.createElement('div');
+      g.className = 'cards'; g.id = 'flat';
+      box.appendChild(g);
+    }
+    var flat = $('flat');
+    if (!flat){ var g2 = document.createElement('div'); g2.className='cards'; g2.id='flat';
+                $('grid').appendChild(g2); flat = g2; }
+    var frag = document.createDocumentFragment();
+    cards.forEach(function(c){ frag.appendChild(makeCard(c)); });
+    flat.appendChild(frag);
+  } else {
+    // 分节: 同组的卡片进同一个 .sec, 标题条插在它前面
+    var bySec = {}, order = [];
+    cards.forEach(function(c){
+      var k = c.group_size > 1 ? 'g' + c.group : 'solo';
+      if (!bySec[k]){ bySec[k] = []; order.push(k); }
+      bySec[k].push(c);
+    });
+    order.forEach(function(k){
+      var list = bySec[k];
+      var gid = list[0].group, gs = list[0].group_size;
+      var warn = list.some(function(c){ return c.uncertain; });
+      var sec = document.createElement('div');
+      sec.className = 'sec'; sec.dataset.sec = k;
+      if (SECS[k] === false) sec.classList.add('closed');
+      var head = document.createElement('div');
+      head.className = 'sechead';
+      head.innerHTML = '<span class="caret">&#9662;</span>' +
+        '<span class="t"></span><span class="n"></span>' +
+        (warn ? '<span class="tag warn">&#9888; 主体存疑</span>' : '');
+      head.querySelector('.t').textContent =
+        gs > 1 ? ('相似帧组 ' + gid) : '单张 (没有可比对的对象)';
+      head.querySelector('.n').textContent = ' ' + list.length + ' 张';
+      head.onclick = function(){
+        var closed = sec.classList.toggle('closed');
+        SECS[k] = !closed;
+        maybeLoadMore();
+      };
+      var box = document.createElement('div');
+      box.className = 'cards';
+      var frag2 = document.createDocumentFragment();
+      list.forEach(function(c){ frag2.appendChild(makeCard(c)); });
+      box.appendChild(frag2);
+      sec.appendChild(head);
+      sec.appendChild(box);
+      $('grid').appendChild(sec);
+    });
+  }
 
   $('bar').style.display = '';
   $('empty').style.display = TOTAL ? 'none' : '';
@@ -437,6 +547,8 @@ function makeCard(c){
   el.dataset.ratio = c.ratio_v;
   el.dataset.best  = c.best;
   el.dataset.multi = c.multi;
+  el.dataset.multiFace = c.multi_face;
+  el.dataset.uncertain = c.uncertain;
   el.dataset.face  = c.face;
   el.dataset.area  = c.area;
   el.dataset.name  = c.name;
@@ -445,14 +557,75 @@ function makeCard(c){
     '<div class="pick"><input type="checkbox" class="cb"></div>' +
     '<img alt="">' +
     '<div class="info">' +
-      (c.badge ? '<span class="badge"></span>' : '') +
+      (c.badge || c.warn ? '<span class="badge"></span>' : '') +
       '<div class="name"></div><div class="sc"></div><div class="meta"></div>' +
+      '<div class="ops">' +
+        '<button class="op" data-a="open" title="用系统默认看图程序打开原图">打开原图</button>' +
+        '<button class="op" data-a="locate" title="在资源管理器里定位并选中这个文件">在文件夹中显示</button>' +
+      '</div>' +
+      '<div class="facepick"></div>' +
     '</div>';
 
-  if (c.badge) el.querySelector('.badge').textContent = c.badge;
+  if (c.badge || c.warn) el.querySelector('.badge').textContent = c.badge + c.warn;
+  if (c.warn) el.querySelector('.badge').title =
+    '这张多脸照片里"最清楚的那张脸"在同组不同帧可能不是同一个人，组内锐度仅供参考';
   el.querySelector('.name').textContent = c.name;
   el.querySelector('.sc').textContent = c.score + c.ratio;
   el.querySelector('.meta').textContent = c.meta;
+
+  // 多脸图: 给个"换主体"下拉。face_metrics 随卡片一起发过来了, 不用再问 Python
+  var fp = el.querySelector('.facepick');
+  var fm = c.face_metrics || [];
+  if (c.n_faces > 1 && fm.length > 1){
+    var sel = document.createElement('select');
+    sel.title = '程序默认选"眼部锐度最高"的那张脸, 但合影里主角不一定是它 —— 可以手动改';
+    fm.forEach(function(m){
+      var o = document.createElement('option');
+      o.value = m.idx;
+      o.textContent = '#' + (m.idx + 1) + '  锐度 ' + Math.round(m.eye)
+                    + '  宽 ' + m.w + 'px';
+      if (m.idx === c.subject_idx) o.selected = true;
+      sel.appendChild(o);
+    });
+    var lab = document.createElement('span');
+    lab.className = 'fplab';
+    lab.textContent = '主体';
+    fp.appendChild(lab);
+    fp.appendChild(sel);
+    sel.onchange = async function(ev){
+      ev.stopPropagation();
+      var idx = parseInt(sel.value, 10);
+      if (idx === c.subject_idx) return;
+      sel.disabled = true;
+      say('正在把 ' + c.name + ' 的主体换成第 ' + (idx + 1) + ' 张脸…');
+      try {
+        var r = await api.set_subject(CUR, c.name, idx);
+        if (r && r.error){ say(r.error, true); sel.value = c.subject_idx; }
+        else {
+          say('已换主体: ' + c.name + '  眼锐度 ' + r.eye_sharp
+              + (r.group ? '  组' + r.group : ''));
+          // 分组可能变了, 整页重拉最稳妥
+          if (CUR) await openFolder(CUR);
+        }
+      } catch(e){ say('换主体失败: ' + e, true); sel.value = c.subject_idx; }
+      sel.disabled = false;
+    };
+  }
+
+  // 别让点按钮冒泡到卡片(卡片点了会切文件夹)
+  el.querySelectorAll('.op').forEach(function(b){
+    b.onclick = async function(ev){
+      ev.stopPropagation();
+      var act = b.dataset.a;
+      try {
+        var r = act === 'open' ? await api.open_original(CUR, c.name)
+                               : await api.show_in_explorer(CUR, c.name);
+        if (r && r.error) say(r.error, true);
+        else say(act === 'open' ? '已用系统看图程序打开 ' + c.name
+                                 : '已在资源管理器中定位 ' + c.name);
+      } catch(e){ say('打不开: ' + e, true); }
+    };
+  });
 
   var img = el.querySelector('img');
   img.src = c.thumb;
@@ -480,6 +653,8 @@ document.querySelector('#folders').addEventListener('click', function(e){
 function applyFilter(){
   var sharp = $('fSharp').value, ratio = $('fRatio').value;
   var best = $('fBest').checked, multi = $('fMulti').checked;
+  var mface = $('fMultiFace').checked;
+  var unc = $('fUncertain').checked;
   var face = $('fFace').value, area = $('fArea').value;
   var vis = [];
   document.querySelectorAll('.card').forEach(function(c){
@@ -488,6 +663,8 @@ function applyFilter(){
     if (ok && ratio !== '' && parseFloat(d.ratio)*100 < parseFloat(ratio)) ok = false;
     if (ok && best && d.best !== '1') ok = false;
     if (ok && multi && d.multi !== '1') ok = false;
+    if (ok && mface && d.multiFace !== '1') ok = false;
+    if (ok && unc && d.uncertain !== '1') ok = false;
     if (ok && face === '1' && d.face !== '1') ok = false;
     if (ok && face === '0' && d.face !== '0') ok = false;
     if (ok && area !== '' && d.area !== area) ok = false;
@@ -495,13 +672,19 @@ function applyFilter(){
     if (ok) vis.push(c.dataset.name);
   });
   $('vcount').textContent = vis.length;
+  // 整节都被筛掉就把标题也藏了, 否则会留一条空的"相似帧组 N"
+  document.querySelectorAll('.sec').forEach(function(s){
+    var any = Array.prototype.some.call(s.querySelectorAll('.card'),
+                                         function(c){ return c.style.display !== 'none'; });
+    s.style.display = any ? '' : 'none';
+  });
   LB = vis;
   if (lbi >= LB.length) lbi = 0;
   $('bMove').disabled = countSel() === 0;
   maybeLoadMore();
 }
 
-['fSharp','fRatio','fBest','fMulti','fFace','fArea'].forEach(function(id){
+['fSharp','fRatio','fBest','fMulti','fMultiFace','fUncertain','fFace','fArea'].forEach(function(id){
   $(id).addEventListener('input', applyFilter);
   $(id).addEventListener('change', applyFilter);
 });
@@ -509,6 +692,7 @@ function applyFilter(){
 $('bReset').onclick = function(){
   $('fSharp').value=''; $('fRatio').value='';
   $('fBest').checked=false; $('fMulti').checked=false;
+  $('fMultiFace').checked=false; $('fUncertain').checked=false;
   $('fFace').value=''; $('fArea').value='';
   applyFilter();
 };
@@ -591,6 +775,11 @@ $('navR').onclick = function(){ navLb(1); };
 $('lb').addEventListener('click', function(e){ if (e.target === $('lb')) $('lb').style.display='none'; });
 $('lbOrig').onclick = async function(){
   var r = await api.show_in_explorer(CUR, LB[lbi]);
+  if (r && !r.ok) say(r.error, true);
+  return false;
+};
+$('lbOpen').onclick = async function(){
+  var r = await api.open_original(CUR, LB[lbi]);
   if (r && !r.ok) say(r.error, true);
   return false;
 };

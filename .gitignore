@@ -27,3 +27,7 @@ __pycache__/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# agent 工具的本地缓存 (不进版本库)
+.codegraph/
+.commandcode/

@@ -14,7 +14,7 @@
 
 - 全离线运行，只读原片，**不会**修改原图（唯一的写操作是用户显式点"移动/复制"）
 - 有两个入口：**GUI 客户端**（单窗口 WebView2）和**命令行**（`cull.py` / `run.bat`）
-- GUI 跑完**默认不写任何中间文件**（见 §7）
+- GUI 跑完**只写结果缓存**（`%LOCALAPPDATA%\cmdc_cull\cache\`，见 §7），照片目录里一个文件都不动
 
 ```
 cull.py     核心算法库 + 命令行入口（无 GUI 依赖，可独立使用）
@@ -128,7 +128,7 @@ folder                 照片目录; 不给则进入交互式(可拖文件夹进
 --full                 全分辨率解码 (更准, 慢约 5 倍)
 --jobs N               并行进程数 (默认 4; 解码受内存带宽限制, 8+ 反而更慢)
 --ratio 0.55           组内锐度低于最佳 x ratio 判为"疑似模糊"
---group-ncc 0.80       相似帧分组严格度 0~1 (越大越严)
+--group-ncc 0.85       相似帧分组严格度 0~1 (越大越严; 0.7~0.8 会把换了人的并进一组)
 --preview-size 2048    大图预览最长边; 0 = 不生成
 --sheet                额外导出检测总览图 (核对人脸检测准不准)
 --model PATH           指定 YuNet 模型路径 (默认自动下载)
@@ -168,11 +168,19 @@ folder                 照片目录; 不给则进入交互式(可拖文件夹进
 | `RAW_EXTS` / `IMG_EXTS` | 支持的扩展名白名单 | **改这里必须同步 `decode()`**，见 §8 |
 | `decode(path, full)` | 解码成 BGR ndarray。按 `IMG_EXTS` 分流到 PIL，其余走 rawpy | 高 |
 | `extract_preview(path)` | 抽 RAW 内嵌预览图作兜底 | 中 |
-| `analyze(path, detector, ...)` | **单张核心**：检测人脸 → 算眼睛锐度 → 出缩略图 | **最高** |
+| `analyze(path, detector, ...)` | **单张核心**：检测人脸 → 逐脸算眼睛锐度 → 取最清楚那张当主体 → 出缩略图 | **最高** |
+| `measure_face(gray, ...)` | 量单张脸的眼部锐度；选脸和"手动换主体"**必须共用**同一口径 | 高 |
+| `pick_subject(gray, faces, ...)` | 遍历所有脸，返回 (主体, 全部框, 全部指标) | 中 |
+| `reselect_subject(row, ...)` | 手动换主体：按需重解码单张并重算 sig/锐度/缩略图 | 中 |
 | `tenengrad_map` / `patch_sharpness` | Tenengrad 梯度能量 | 高 |
 | `face_signature` | 人脸区域归一化灰度指纹，用于判断两帧是否同一姿势 | 中 |
-| `group_frames(rows, ...)` | 把相似帧聚成组 | **高**（阈值调错会误判） |
-| `compute_flags(rows, ...)` | **纯计算**，打上组/锐度占比/最佳/模糊标记，不碰磁盘 | 低 |
+| `group_frames(rows, ...)` | 把相似帧聚成组（并查集，传递闭包） | **高**（阈值调错会误判） |
+| `_same_pose(a, b, ...)` | 两帧是否"同一个人的相近姿态"，四道门槛 | **高** |
+| `_subject_may_differ(group)` | 组内主体脸 IoU 过低 → 标 ⚠ 提醒锐度不可比 | 中 |
+| `_face_iou_norm(a, b)` | 主体脸框交并比（**坐标要归一化**，不同照片分辨率不同） | 中 |
+| `compute_flags(rows, ...)` | **纯计算**，打上组/锐度占比/最佳/模糊/存疑标记，不碰磁盘 | 低 |
+| `HardStopPool` | 能 terminate 的进程池（取消时真能停下来） | **高** |
+| `write_cache` / `read_cache` | 结果缓存；字段值必须是 python 类型（见 §8.7） | 中 |
 | `write_reports(...)` | 调 `compute_flags` 后写 CSV/txt/HTML | 低 |
 | `write_csv(rows, path)` | 只写 CSV（GUI 导出用） | 低 |
 | `list_photos(folder)` | 列出待分析文件，跳过已有 RAW 的 jpg 导出版 | 低 |
@@ -195,20 +203,39 @@ folder                 照片目录; 不给则进入交互式(可拖文件夹进
 | `add_folders(dirs)` | **把文件夹加进队列**（JS 改了列表必须同步调这个） |
 | `remove_folder(path)` | 队列上的 × 按钮 |
 | `get_queue()` | 页面启动时拉一次（接命令行传的参数） |
-| `analyze(full, jobs)` | 起后台线程，立即返回 |
+| `analyze(full, jobs, force)` | 起后台线程，立即返回 |
 | `cancel()` | 中止这一轮，结果全丢但文件夹留在队列 |
 | `poll()` | 页面每 200ms 拉消息队列 |
-| `get_batch(folder, off, limit)` | 分页取卡片数据（缩略图 base64） |
+| `get_batch(folder, off, limit, sort)` | 分页取卡片数据（缩略图 base64）；`sort` 决定同组是否排在一起 |
 | `get_big(folder, name)` | 点开看大图，带内存 LRU |
+| `get_face_choices(folder, name)` | 列出某张检出的所有脸（供"换主体"下拉，不重解码） |
+| `set_subject(folder, name, idx)` | 手动换主体：重解码该张 → 重算 sig/锐度/缩略图 → 整体重算分组 |
 | `move(folder, names, dest, copy, preview_dir)` | 移动/复制 + 可选生成预览 |
 | `export_csv` / `export_list` | 手动导出 |
 | `show_in_explorer(folder, name)` | 资源管理器里选中原文件 |
+| `open_original(folder, name)` | 用系统默认看图程序打开原图（`os.startfile`） |
 
 **关键常量**：`BATCH=60`（每次取多少张卡片）、`BIG_SIDE=1600`、
 `BIG_CACHE_MAX=64`（大图 LRU，约 22MB）
 
 **并发模型**：一个后台线程跑 `_run_queue`，所有进展通过 `queue.Queue` 传给
 `poll()`。取消靠 `threading.Event`。`_run_id` 用来作废过期轮次的消息。
+
+**排序（`Api._order_rows()`）**：界面排序下拉框三选一，决定同组照片是否挨在一起。
+
+| `sort` | 行为 |
+|---|---|
+| `sharp` | 旧行为：按锐度降序平铺，不分节（默认，向后兼容） |
+| `group` | 多张组集中置顶（强的组在前），组内按锐度降序，其后是单张 |
+| `name` | 按文件名走，但同组聚成一块（组落在它最早那张的位置上） |
+
+⚠ **分节模式下不能把一组切成两页**。`get_batch()` 是 offset 分页，如果一页正好
+切在某组中间，组标题会在两页各出现一次、同组照片也隔着屏幕。所以碰到切中的组时，
+`get_batch` 会**多带几张把整组取完**（`gs > 1` 那个 while 循环）。实测每页 3 张
+也能拿全且不重复。代价是最多超发 `group_size-1` 张。
+
+**换排序必须从头重拉**（`fSort.onchange` 调 `openFolder`）—— 顺序变了不能拿旧
+的 offset 续着接。折叠状态存在 `SECS` 里，翻页时按 key 恢复。
 
 ### `ui.html` — 原生 JS，无框架无构建
 
@@ -255,10 +282,26 @@ excludes=[matplotlib, scipy, pandas, PyQt5, PySide6, IPython, ...]
 
 ## 7. 输出行为（重要）
 
-**GUI 客户端：默认一个文件都不写。**
+**GUI 客户端：只写结果缓存，不写照片目录。**
 
 结果只在窗口里显示；大图在内存 LRU 里。想落盘得点「导出 CSV…」/「导出勾选清单…」，
 或者勾上「生成预览 jpg」并指定目录。
+
+**结果缓存**（`cull.py` 的 `write_cache` / `read_cache`）：
+
+- 位置：`%LOCALAPPDATA%\cmdc_cull\cache\<sha1>.json`，**不在照片目录里**
+- 目的：同一批照片第二次点「开始分析」直接读结果，不再逐张解码 RAW
+- 勾选框「忽略缓存重扫」= `analyze(full, jobs, force=True)`，用完自动取消勾选
+- 过期自动重扫：`version` / `full` 标志 / 照片集合 / 每张的大小+修改时间，任一对不上就重算
+- **不能改用 CSV 当中转**：CSV 写的是已格式化的字符串（`"1/125"`、`"眼睛"`），
+  而 `get_batch()` 要的是原始类型（`(1,125)` 元组、`"face"`）
+- **必须存 `sig`**：`group_frames()` 靠它做 NCC 相似度分组，少了它所有照片会退化成
+  单张组，"组内最佳/疑似模糊"全失效。所以缓存存的是**原始测量值**，
+  `group`/`soft`/`best_in_group` 交给 `read_cache` 里的 `compute_flags()` 重算
+- **必须存 `_face_box` / `_face_metrics` / `subject_idx`**：前两个给 ⚠ 标记和
+  「换主体」下拉用，后者记着当前选的是第几张脸
+- 体积：实测约 8.4KB/张（无脸时），54 张一批约 0.4MB
+- 命令行**不写**缓存
 
 **命令行：写到 `<照片目录>/_cull_out/`**
 
@@ -314,7 +357,28 @@ await api.add_folders(dirs);           // 这行不能少
 同理，队列上的 × 必须调 `api.remove_folder()`，否则 Python 还留着路径，
 再加回来会被 `add_folders` 当成"已存在"跳过 —— **那个文件夹再也分析不了**。
 
-### 8.3 取消只能置标志，不能动 `_run_id`
+### 8.3 重新分析"已完成"的文件夹，targets 必须含 `done_dirs`
+
+第一遍跑完，文件夹会从 `queue_dirs` 挪进 `done_dirs`。而界面 `updateRun()`
+只排除 `state==='run'`，所以"已完成"的文件夹**可以**再点「开始分析」。
+
+于是 `analyze()` 最初只读 `queue_dirs`，第二遍就返回 `{"ok":false}`，
+后台线程压根没起，界面永远停在"正在分析…"、取消按钮也点不动。
+现在 `analyze()` 算的是 `queue_dirs + done_dirs`。
+
+配套两个坑：
+
+1. **不能重复 append `done_dirs`** —— 重跑时它已经在里面了，再 append 一次
+   就重复，第二遍 targets 里同一路径出现两次。循环开头要先 remove。
+2. **不能靠"不在 queue_dirs 里"反推是否已完成** —— 循环开头就把 d 摘出队列了，
+   所以被取消的那个同样不在队列里，会被误判成已完成而**从界面上彻底消失**。
+   必须用显式的 `handled` 集合记下"这轮真的处理完了哪些"。
+
+另外 `analyze()` 出错是 **resolve `{ok:false}` 而不是 reject**，所以 ui.html 的
+`.then(function(r){...})` 里必须把 `state` 退回 `wait`，否则全卡在 `run`，
+`bRun` 永久禁用（这正是"提示正在分析…且无法取消"的表现）。
+
+### 8.4 取消只能置标志，不能动 `_run_id`
 
 ```python
 def cancel(self):
@@ -325,45 +389,86 @@ def cancel(self):
 递增 `_run_id` 会让后台线程以为任务过期**直接退出**，于是不发 `idle`，
 界面永远卡在"分析中"。`_run_id` 只在 `analyze()` 开始新一轮时递增。
 
-### 8.4 预览 jpg 必须在搬文件**之前**生成
+### 8.5 光置标志停不住 worker，必须 terminate
+
+`shutdown(wait=False, cancel_futures=True)` **停不下**已经在跑的任务：它只对
+*还没开始* 的 future 生效，而 `ProcessPoolExecutor` 一旦把任务全提交，队列里
+就没有"还没开始"的了。实测点了取消之后**又解码了 48 张**，4 个 worker 全程占着
+几百 MB 内存继续读盘，界面却已经显示"已取消"。
+
+所以取消要走 `HardStopPool.stop()` → `terminate()` 掉所有 worker（正在解码的
+那张当场掐断，只丢内存里的结果，不动源文件）。
+
+两个坑：
+
+1. **别把 `shutdown()` 写在 `with` 块里靠 `__exit__` 兜底** —— `__exit__` 走的是
+   `shutdown(wait=True)`，会把所有 future **drain 完**。
+2. **terminate 之后池子会变 broken**，在途 future 抛的是 `BrokenProcessPool`
+   而不是 `CancelledError`。直接冒泡会在界面上弹一屏 traceback，所以
+   `_analyze_one` 里要用 `_cancelled(run_id)` 判断该报什么。
+
+另外 `cancel()` 是从 JS 桥线程调的，和后台线程 drain 有竞态，所以循环内也留了
+`if self._cancelled(run_id): break` —— 哪条路径先到都能立刻停。
+
+### 8.6 预览 jpg 必须在搬文件**之前**生成
 
 勾了"移动"的话，搬完源文件就没了，再生成就找不到源。
 `Api.move()` 里顺序是 `_write_previews()` → `do_move()`。
 
-### 8.5 不能抽 RAW 内嵌预览图当预览
+### 8.7 numpy 标量会让缓存静默失效
+
+`np.float32` **不能** `json.dumps`。而 `face_cx` / `face_cy` / `face_area_pct`
+都是 numpy 算出来的，直接丢进 `write_cache()` 会抛
+`TypeError: Object of type float32 is not JSON serializable`。
+
+危险的是 `write_cache` 外面包了 `try/except` 且不抛出，于是**每张照片都
+写不进去、而程序毫无察觉** —— 缓存功能看起来"配了"但从来没生效过。
+
+所以 `analyze()` 里把选中的脸/眼框显式转成 python `float`，`write_cache`
+里再用 `_py()` 兜底（`np.generic` → `.item()`，`ndarray` → `.tolist()`，
+递归处理 list）。**新增任何来自 numpy 的字段时记得走 `_py()`。**
+
+### 8.8 `_face_box` 必须进缓存
+
+`_subject_may_differ()` 靠 `_face_box` 算主体脸框的 IoU 来打 ⚠。缓存里
+漏了它，第二次读缓存就再也标不出"主体可能不是同一个人"。
+
+`_CACHE_FIELDS` 里已经包含 `_face_box` / `_eye_boxes` / `_face_boxes`。
+
+### 8.9 不能抽 RAW 内嵌预览图当预览
 
 看着很诱人：0.000s vs 0.30s，快 300 倍。但实测 A7R III 的内嵌预览
 **1616x1080 却转了 90 度**，而且**没有 EXIF Orientation 标记**，程序无法自动转正。
 拿侧躺的人像给 AI 看，建议会完全离谱。所以老老实实重新解码。
 
-### 8.6 `IMG_EXTS` 和 `decode()` 必须同步
+### 8.10 `IMG_EXTS` 和 `decode()` 必须同步
 
 加了新后缀但 `decode()` 没认，它会掉进 rawpy 分支，然后报"找不到内嵌预览图"
 （那是给 RAW 用的兜底，对普通图片没意义）。`decode()` 现在按 `IMG_EXTS` 判断。
 
-### 8.7 `collect_all('webview')` 不能省
+### 8.11 `collect_all('webview')` 不能省
 
 `webview/js/` 用 `os.path.realpath(__file__)` 读，PyInstaller 默认把纯 Python
 塞进 `base_library.zip`，`open()` 读不到 → 界面直接白屏。
 pythonnet 同理（.NET dll 必须落在磁盘上）。
 
-### 8.8 多进程 + 打包必须 `freeze_support()`
+### 8.12 多进程 + 打包必须 `freeze_support()`
 
 Windows 用 spawn 启动子进程。`app.py` 和 `cull.py` 的 `__main__` 里都有，
 **别删**。测试脚本如果直接调 `_analyze_one()` 也得有 `if __name__ == "__main__"` 保护。
 
-### 8.9 OpenCV 线程超订
+### 8.13 OpenCV 线程超订
 
 OpenCV 默认开满所有核。4 个进程 × 20 线程 = 80 线程抢 20 核，
 实测把 54 张的处理从 13 秒拖到 **44 秒**。所以多进程时每个进程的
 OpenCV 线程数被压到 1（`worker_init` 的 `cv_threads` 参数）。
 
-### 8.10 run.bat 故意只用 ASCII
+### 8.14 run.bat 故意只用 ASCII
 
 cmd.exe 读 .bat 时按控制台代码页解析，里面写中文会被拆成乱命令（实测过）。
 中文提示全放在 `cull.py` 里，由 `chcp 65001` 保证显示。**改这个 bat 请保持纯英文。**
 
-### 8.11 跨盘移动
+### 8.15 跨盘移动
 
 `os.path.commonpath` 在 `F:\` 和 `C:\` 之间会抛 `ValueError`。
 `do_move()` 先比盘符再算公共路径。搬到别的盘是支持的。
@@ -375,11 +480,68 @@ cmd.exe 读 .bat 时按控制台代码页解析，里面写中文会被拆成乱
 ### 评分逻辑
 
 1. `rawpy` 解码 RAW，拿原始像素（默认半分辨率，约 0.3s/张），**多进程并行**
-2. OpenCV **YuNet** 轻量 CNN 检测人脸，给出双眼等 5 个关键点
-3. 在眼睛位置的原始像素上算 **Tenengrad 梯度能量**（合焦的眼睛边缘锐利，跑焦的被抹平）
-4. 按「脸的位置 + 脸大小 + 焦距」把几乎同一姿势的帧聚成一组，
+2. OpenCV **YuNet** 轻量 CNN 检测人脸，给出双眼等 5 个关键点（**返回全部人脸**）
+3. 逐张脸在眼睛位置的原始像素上算 **Tenengrad 梯度能量**，**取最清楚的那张脸当主体**
+4. 按「脸的位置 + 脸大小 + 焦距 + 脸部指纹 NCC」把相近姿态的帧聚成一组，
    **只在组内比较**（不同距离/焦段的锐度本来就没有可比性）
 5. 组内挑最锐的，低于组内最佳 × ratio 的标为"疑似模糊"
+
+### 多脸怎么选主体（`analyze()`）
+
+**取所有脸里眼部锐度最高的那张**，不是最大的那张。实测一批 25 张合影，
+`max(面积)` 选出的脸有 **21/25** 不是最清楚的，偏差 15%~97% ——
+合影里主角的脸往往不是最大的（大的在前排路人）。
+
+`sig`（人脸指纹）必须取**选中那张脸**的，否则分组会拿 A 图的第 3 张脸去和
+B 图的第 1 张脸比，主体就漂了。
+
+**怎么量的锐度**（`measure_face()`）：用 YuNet 给的双眼关键点，各画一个
+`脸宽×0.24` 的方框 → 高斯模糊(σ=1) → Sobel → 取 `(gx²+gy²)` 的**均值**，
+两只眼取平均。
+
+⚠ **这个度量有已知偏差，改不掉**：
+
+- Tenengrad 是**均值**，会被脸的大小和对比度带偏。实测同一张图里 w=112 的
+  远处小脸拿 8297 分，w=265 的近景大脸只拿 1134 分。
+- 试过面积归一化、对比度归一化、面积优先三种改法，跟"面积最大（最近）"的
+  **一致率都只有 20%~32%**，换不出可靠改善。
+- 25 张里有 **6 张**头部只领先次头部 1.01~1.09 倍 —— 这两张脸人眼也很难分高下。
+
+**所以做成手动可控**：多脸卡片上给「主体」下拉，列出每张脸的锐度/脸宽/位置，
+`set_subject()` 换完会重算 sig 和分组。换主体要**重新解码那一张**（sig 和
+`face_sharp` 都依赖原图像素，缓存里算不出来），约 0.3s。
+
+**⚠ 已知局限**：即使程序选了"最清楚"那张，主体仍可能**在人之间跳**。所以
+`_subject_may_differ()` 会算出组内主体脸框的 IoU，低于 0.30 就在卡片上标 ⚠，
+**提醒用户这种组的组内锐度不可比**。要根治得做跨照片的主体追踪，目前没做。
+
+### 分组阈值（`group_frames()`）
+
+现在是**并查集**（传递闭包），不是贪心首次匹配 —— 以前只跟组代表比，
+A~B 像、B~C 像但 A~C 不像时 C 进不了 A 那组。
+
+阈值是**逐对量出来的**，不是拍脑袋（那批 25 张，逐对 300 个组合）：
+
+| 参数 | 最初 | 中间试过 | 现在 | 说明 |
+|---|---|---|---|---|
+| `ncc_min` | 0.80 | 0.60 | **0.85** | 见下 |
+| `pos_tol` | 0.035 | 0.12 | 0.12 | 脸中心偏移占画幅比例 |
+| `size_tol` | 0.12 | 0.30 | 0.30 | log2，约 1.23 倍脸宽 |
+| `focal_tol` | 0.06 | 0.15 | 0.15 | 约 1.11 倍焦距 |
+
+**`ncc_min` 为什么是 0.85**（这批数据实测的分界）：
+
+- 原来的 0.80：300 个组合里**一对都过不了**（最高才 0.794）→ 25 张全是单张组
+- 调到 0.60：分出 3 个组，但人工核对发现**其中 2 个是换了人**
+- 逐对量：**正确的对 NCC=0.905，错误的对是 0.847 和 0.633**。位置差、脸宽差、
+  IoU 全都分不开（正确对的位置差 0.085 反而比错误对还大）。**只有 NCC 能干净切开**：
+  ≥0.85 时恰好只留下正确的那一对，≥0.92 就什么都不剩
+
+⚠ **0.85 是拟合这 25 张得出的，样本只有 3 对，别的场景要重新量**。
+换场景时用 `--group-ncc` 现场调：0.7~0.8 会把换了人的并进一组。
+
+`pos_tol` 保留 —— 它是区分「不同的人」最有效的一道闸。`_same_pose()` 里
+还预留了 `iou_min`（主体脸框重叠下限，默认 0），需要时可以开。
 
 ### 性能（实测，20 核机器，54 张 42MP ARW）
 

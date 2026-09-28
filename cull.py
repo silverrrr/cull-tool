@@ -23,8 +23,10 @@
 import argparse
 import base64
 import csv
+import hashlib
 import html
 import io
+import itertools
 import json
 import math
 import os
@@ -32,6 +34,7 @@ import pathlib
 import shutil
 import struct
 import sys
+import tempfile
 import time
 import urllib.request
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -350,12 +353,80 @@ def read_sony_af(path):
 _W = {}
 
 
+class HardStopPool:
+    """能真正打断的 ProcessPoolExecutor。
+
+    为什么不能直接用 ProcessPoolExecutor:
+      shutdown(wait=False, cancel_futures=True) 只是不再派发**还没开始**的任务,
+      已经跑起来的那几张照样解码完。而 cancel_futures=True 会把这些在途的 future
+      直接标成 CANCELLED, as_completed() 收到的是个还没做完的 future, 调 result()
+      立刻抛 CancelledError —— 于是调用方以为"已停", 实际 worker 进程还占着几百 MB
+      内存继续读盘。这正是点了取消之后后台还在解码的原因。
+
+    这里改成: 取消时先 terminate 掉所有 worker (正在解码的那几张当场丢掉),
+    再 join 回收。只丢结果, 不动源文件。
+    """
+
+    def __init__(self, max_workers, initializer=None, initargs=()):
+        self._ex = ProcessPoolExecutor(max_workers=max_workers,
+                                       initializer=initializer,
+                                       initargs=initargs)
+        self._closed = False
+
+    def submit(self, fn, *a):
+        return self._ex.submit(fn, *a)
+
+    def as_completed(self, futs):
+        return as_completed(futs)
+
+    def stop(self):
+        """terminate 所有 worker 并回收。幂等, 异常也不怕。"""
+        if self._closed:
+            return
+        self._closed = True
+        # _processes 是 {pid: Process}, 要取 values(); 直接遍历拿到的是 pid(int)
+        try:
+            procs = list((self._ex._processes or {}).values())
+        except AttributeError:
+            procs = []
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:                            # noqa: BLE001
+                pass
+        for p in procs:
+            try:
+                p.join(timeout=5)
+            except Exception:                            # noqa: BLE001
+                pass
+        for p in procs:
+            if p.is_alive():
+                try:
+                    p.kill()
+                    p.join(timeout=5)
+                except Exception:                        # noqa: BLE001
+                    pass
+        try:
+            self._ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:                                # noqa: BLE001
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None or not self._closed:
+            self.stop()
+        return False
+
+
 def worker_init(model_path, full, preview_dir=None, preview_side=2048, cv_threads=1):
     # 多进程时要把 OpenCV 自己的线程数压下来: 默认它会开满所有核,
     # 4 个进程 x 20 线程 = 80 线程抢 20 个核, 反而把整体拖慢。
     if cv_threads and cv_threads > 0:
         cv2.setNumThreads(cv_threads)
     _W["det"] = make_detector(model_path)
+    _W["det_model"] = model_path      # reselect_subject 要重新建一个检测器
     _W["full"] = full
     _W["preview_dir"] = preview_dir
     _W["preview_side"] = preview_side
@@ -382,7 +453,7 @@ def process_one(name, folder):
         rec.update({"_error": str(exc), "subject": "?", "compare_value": 0.0,
                     "eye_sharp": 0.0, "face_sharp": 0.0, "sharp_global": 0.0,
                     "faces": 0, "_thumb": "", "preview_rel": "", "_face_box": None,
-                    "_eye_boxes": [], "sig": None,
+                    "_eye_boxes": [], "sig": None, "_face_boxes": [],
                     "face_w": 0, "face_cx": 0, "face_cy": 0, "face_area_pct": 0,
                     "face_conf": 0, "brightness": 0, "clipped": 0, "decoded": "", "_ms": 0})
     try:
@@ -439,6 +510,105 @@ def face_signature(gray, box, size=64):
 # ==========================================================================
 # 单张分析
 # ==========================================================================
+def measure_face(gray, fx, fy, fw, fh, lms):
+    """量一张脸的眼部锐度。返回 (eye_sharp, eye_boxes)。
+
+    这是选脸和"手动换主体"共用的唯一口径 —— 两者必须算得一模一样,
+    否则用户手动换了主体, 分数却对不上。
+    """
+    er = max(10.0, fw * 0.24)
+    eyes = []
+    for ex, ey in (lms[0], lms[1]):
+        t, _c = patch_sharpness(gray, ex, ey, er)
+        if t > 0:
+            eyes.append(t)
+    eye = float(np.mean(eyes)) if eyes else 0.0
+    boxes = [[int(ex - er), int(ey - er), int(2 * er), int(2 * er)]
+             for ex, ey in (lms[0], lms[1])]
+    return eye, boxes
+
+
+def pick_subject(gray, faces, inv, W, H):
+    """遍历所有脸量眼部锐度, 返回 (best, all_boxes, all_metrics)。
+
+    best 是个 dict: {eye, fx, fy, fw, fh, lms, conf, er, eye_boxes, idx}
+    all_metrics 是每张脸的摘要, 供界面列出来让你手动选。
+    """
+    best = None
+    all_boxes = []
+    metrics = []
+    for idx, f in enumerate(faces):
+        fx, fy, fw, fh = [float(v) * inv for v in f[:4]]
+        lms = (f[4:14].reshape(5, 2) * inv)
+        conf = float(f[-1])
+        # numpy 标量 (np.float32) 不能 json 序列化, 而 face_cx/face_cy/
+        # face_area_pct 都由它们算出来 —— 不先转成 python float 的话
+        # write_cache() 会对每一张都静默失败。这里统一转掉。
+        eye, eboxes = measure_face(gray, fx, fy, fw, fh, lms)
+        all_boxes.append([int(fx), int(fy), int(fw), int(fh)])
+        metrics.append({"idx": idx, "eye": round(eye, 1), "w": int(fw),
+                        "cx": round((fx + fw / 2) / W, 4),
+                        "cy": round((fy + fh / 2) / H, 4),
+                        "conf": round(conf, 2)})
+        cand = {"eye": eye, "fx": fx, "fy": fy, "fw": fw, "fh": fh,
+                "lms": lms, "conf": conf, "er": max(10.0, fw * 0.24),
+                "eye_boxes": eboxes, "idx": idx}
+        if best is None or cand["eye"] > best["eye"]:
+            best = cand
+    return best, all_boxes, metrics
+
+
+# ==========================================================================
+# 换主体: 用户在界面上点了"第 N 张脸才是主角"
+# ==========================================================================
+def reselect_subject(row, name, folder, idx, full=False, af_point=None):
+    """把 row 的主体换成第 idx 张脸, 原地更新并返回它。
+
+    为什么要重新解码: 换了主体之后 `sig`(人脸指纹) 和 `face_sharp` 都得跟着
+    变, 而这俩都需要原图像素 —— 缓存里只存了缩略图, 算不出来。
+    所以"换主体"这一次是按需重解码单张 (~0.3s), 换完立刻写回缓存。
+    """
+    path = os.path.join(folder, name)
+    bgr, from_preview = decode(path, full=full)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    H, W = gray.shape
+    sc = DET_W / max(H, W)
+    small = (cv2.resize(gray, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+             if sc < 1 else gray)
+    det = make_detector(_W["det_model"]) if _W.get("det_model") else None
+    if det is None:
+        det = make_detector(ensure_model(None))
+    det.setInputSize((small.shape[1], small.shape[0]))
+    _, faces = det.detect(cv2.cvtColor(small, cv2.COLOR_GRAY2BGR))
+    faces = [] if faces is None else faces
+    if idx < 0 or idx >= len(faces):
+        raise ValueError("这张照片没有那么多张脸 (检出 %d 张)" % len(faces))
+    inv = 1.0 / sc
+    f = faces[idx]
+    fx, fy, fw, fh = [float(v) * inv for v in f[:4]]
+    lms = (f[4:14].reshape(5, 2) * inv)
+    conf = float(f[-1])
+    eye, eboxes = measure_face(gray, fx, fy, fw, fh, lms)
+    face_ten, _ = patch_sharpness(gray, fx + fw / 2, fy + fh / 2, max(fw, fh) * 0.55)
+    row.update({
+        "eye_sharp": round(eye, 1),
+        "face_sharp": round(face_ten, 1),
+        "face_conf": round(conf, 2),
+        "face_w": int(fw),
+        "face_cx": round((fx + fw / 2) / W, 4),
+        "face_cy": round((fy + fh / 2) / H, 4),
+        "face_area_pct": round(fw * fh / (W * H) * 100, 2),
+        "sig": face_signature(gray, (fx, fy, fw, fh)),
+        "_face_box": [int(fx), int(fy), int(fw), int(fh)],
+        "_eye_boxes": eboxes,
+        "subject_idx": idx,
+        "compare_value": round(eye, 1),
+    })
+    row["_thumb"] = make_thumb(bgr, row["_face_box"], eboxes, af_point,
+                               all_face_boxes=row.get("_face_boxes"))
+    return row
+
+
 def analyze(path, detector, full=False, af_point=None, preview_path=None, preview_side=2048):
     rec = {}
     t0 = time.time()
@@ -457,21 +627,15 @@ def analyze(path, detector, full=False, af_point=None, preview_path=None, previe
 
     inv = 1.0 / sc
     subject_label = "center"
-    used_boxes = []
     if len(faces):
-        f = max(faces, key=lambda v: v[2] * v[3])
-        fx, fy, fw, fh = [v * inv for v in f[:4]]
-        lms = (f[4:14].reshape(5, 2) * inv)
-        conf = float(f[-1])
-
-        # 眼睛区域锐度 (原图分辨率上算)
-        er = max(10, fw * 0.24)
-        eyes = []
-        for ex, ey in (lms[0], lms[1]):
-            t, c = patch_sharpness(gray, ex, ey, er)
-            if t > 0:
-                eyes.append(t)
-        eye_sharp = float(np.mean(eyes)) if eyes else 0.0
+        # YuNet 已经返回了所有人脸, 以前这里一行 max(面积) 就把其他的全丢了 ——
+        # 而合影里主角的脸往往不是最大的 (大的是前排路人), 于是系统性选错主体。
+        # 现在逐张脸算眼部锐度, 取最清楚的那张当主体;
+        # 用户也可以在界面上手动换 (见 Api.set_subject)。
+        best, all_face_boxes, face_metrics = pick_subject(gray, faces, inv, W, H)
+        eye_sharp, fx, fy, fw, fh = best["eye"], best["fx"], best["fy"], best["fw"], best["fh"]
+        lms, conf, er, eboxes = (best["lms"], best["conf"], best["er"],
+                                 best["eye_boxes"])
         face_ten, face_std = patch_sharpness(gray, fx + fw / 2, fy + fh / 2, max(fw, fh) * 0.55)
 
         rec.update({
@@ -482,18 +646,23 @@ def analyze(path, detector, full=False, af_point=None, preview_path=None, previe
             "face_cx": round((fx + fw / 2) / W, 4),
             "face_cy": round((fy + fh / 2) / H, 4),
             "face_area_pct": round(fw * fh / (W * H) * 100, 2),
+            # sig 必须是**当前主体那张脸**的指纹, 否则分组会拿 A 图的第 3 张脸
+            # 去和 B 图的第 1 张脸比, 主体就漂了
             "sig": face_signature(gray, (fx, fy, fw, fh)),
             "_face_box": [int(fx), int(fy), int(fw), int(fh)],
-            "_eye_boxes": [[int(ex - er), int(ey - er), int(2 * er), int(2 * er)] for ex, ey in (lms[0], lms[1])],
+            "_eye_boxes": eboxes,
+            "_face_boxes": all_face_boxes,
+            "_face_metrics": face_metrics,
+            "subject_idx": best["idx"],
         })
         subject_label = "face"
-        used_boxes = rec["_face_box"][:]
         rec["compare_value"] = rec["eye_sharp"]
     else:
         t, c = patch_sharpness(gray, W * 0.5, H * 0.45, min(W, H) * 0.22)
         rec.update({"eye_sharp": 0.0, "face_sharp": round(t, 1), "face_conf": 0.0,
                     "face_w": 0, "face_cx": 0.5, "face_cy": 0.45, "face_area_pct": 0,
-                    "sig": None, "_face_box": None, "_eye_boxes": []})
+                    "sig": None, "_face_box": None, "_eye_boxes": [],
+                    "_face_boxes": [], "_face_metrics": [], "subject_idx": -1})
         rec["compare_value"] = rec["face_sharp"]
 
     rec["subject"] = subject_label
@@ -501,7 +670,8 @@ def analyze(path, detector, full=False, af_point=None, preview_path=None, previe
     rec["sharp_global"] = round(float(tenengrad_map(g).mean()), 1)
     rec["brightness"] = round(float(gray.mean()), 1)
     rec["clipped"] = round(float(((gray > 250).sum() + (gray < 5).sum()) / gray.size * 100), 2)
-    rec["_thumb"] = make_thumb(bgr, rec["_face_box"], rec["_eye_boxes"], af_point)
+    rec["_thumb"] = make_thumb(bgr, rec["_face_box"], rec["_eye_boxes"], af_point,
+                               all_face_boxes=rec.get("_face_boxes"))
     rec["preview_rel"] = ""
     if preview_path:
         try:
@@ -519,17 +689,28 @@ def analyze(path, detector, full=False, af_point=None, preview_path=None, previe
     return rec
 
 
-def make_thumb(bgr, face_box, eye_boxes, af_point=None, max_w=360, quality=78):
-    """用 cv2 缩略图 + 画框 (比 PIL LANCZOS 快数倍, 实测 84ms -> ~15ms)。"""
+def make_thumb(bgr, face_box, eye_boxes, af_point=None, max_w=360, quality=78,
+               all_face_boxes=None):
+    """用 cv2 缩略图 + 画框 (比 PIL LANCZOS 快数倍, 实测 84ms -> ~15ms)。
+
+    all_face_boxes 给了就把检出的**所有**脸都画出来 (暗红细框), 选中的那张
+    用亮红粗框 —— 界面上就能一眼看出"这张检出 8 张脸, 用的是哪一张"。
+    """
     h, w = bgr.shape[:2]
     k = max_w / w
     im = cv2.resize(bgr, (max_w, max(1, round(h * k))), interpolation=cv2.INTER_AREA)
-    if face_box:
-        x, y, bw, bh = [int(round(v * k)) for v in face_box]
-        cv2.rectangle(im, (x, y), (x + bw, y + bh), (64, 96, 255), 2)        # 红 = 人脸
+    sel = [int(round(v)) for v in face_box] if face_box else None
+    for fb in (all_face_boxes or []):
+        x, y, bw, bh = [int(round(v * k)) for v in fb]
+        if sel and [int(round(v)) for v in fb] == sel:
+            continue                      # 选中那张最后画粗框
+        cv2.rectangle(im, (x, y), (x + bw, y + bh), (60, 40, 150), 1)   # 暗红 = 其他脸
+    if sel:
+        x, y, bw, bh = [int(round(v * k)) for v in sel]
+        cv2.rectangle(im, (x, y), (x + bw, y + bh), (64, 96, 255), 2)   # 亮红 = 主体
     for x, y, bw, bh in (eye_boxes or []):
         x, y, bw, bh = [int(round(v * k)) for v in (x, y, bw, bh)]
-        cv2.rectangle(im, (x, y), (x + bw, y + bh), (255, 210, 0), 1)        # 青 = 眼睛区域
+        cv2.rectangle(im, (x, y), (x + bw, y + bh), (255, 210, 0), 1)   # 青 = 眼睛区域
     if af_point:                                                            # 绿 = 相机设定的对焦点
         ax, ay = int(round(af_point[0] * im.shape[1])), int(round(af_point[1] * im.shape[0]))
         cv2.circle(im, (ax, ay), 13, (0, 220, 0), 2)
@@ -547,37 +728,116 @@ def ncc(a, b):
     return float(np.dot(a, b) / a.size)
 
 
-def group_frames(rows, pos_tol=0.035, size_tol=0.12, ncc_min=0.80, focal_tol=0.06):
-    """只在「几乎同一姿势」的帧之间做对比。
+def _same_pose(a, b, pos_tol, size_tol, ncc_min, focal_tol, iou_min=0.0):
+    """两张照片的主体是不是"同一个人的相近姿态"。几道门槛全过才算。
 
-    阈值故意收得很紧: 经验上整组人像里只有真正连拍/复拍的那几对能进来,
-    松一点就会把不同姿势的帧并在一起, 于是"组内最佳"和"疑似模糊"都会误报。
+    iou_min 是"主体脸框"的重叠下限 —— 位置差只管脸中心, 但两张照片里
+    主体压根不是同一个人时, 脸中心照样可能靠得很近 (同一排座位上的邻座)。
+    IoU 补的就是这个洞。
     """
-    groups = []
-    for r in sorted(rows, key=lambda x: x["file"]):
-        if r.get("subject") != "face" or r.get("sig") is None:
-            groups.append([r])
-            continue
-        placed = False
-        for g in groups:
-            rep = g[0]
-            if rep.get("subject") != "face" or rep.get("sig") is None:
-                continue
-            if abs(math.log2(max(r["face_w"], 1) / max(rep["face_w"], 1))) > size_tol:
-                continue
-            if math.hypot(r["face_cx"] - rep["face_cx"], r["face_cy"] - rep["face_cy"]) > pos_tol:
-                continue
-            fr, fp = r.get("focal_length"), rep.get("focal_length")
-            if fr and fp and abs(math.log2((fr[0] / fr[1]) / (fp[0] / fp[1]))) > focal_tol:
-                continue
-            if ncc(r["sig"], rep["sig"]) < ncc_min:
-                continue
-            g.append(r)
-            placed = True
-            break
-        if not placed:
-            groups.append([r])
-    return groups
+    if abs(math.log2(max(a["face_w"], 1) / max(b["face_w"], 1))) > size_tol:
+        return False
+    if math.hypot(a["face_cx"] - b["face_cx"], a["face_cy"] - b["face_cy"]) > pos_tol:
+        return False
+    fr, fp = a.get("focal_length"), b.get("focal_length")
+    if fr and fp and abs(math.log2((fr[0] / fr[1]) / (fp[0] / fp[1]))) > focal_tol:
+        return False
+    if iou_min > 0 and _face_iou_norm(a, b) < iou_min:
+        return False
+    return ncc(a["sig"], b["sig"]) >= ncc_min
+
+
+def group_frames(rows, pos_tol=0.12, size_tol=0.30, ncc_min=0.85, focal_tol=0.15,
+                 iou_min=0.0):
+    """把「同一个人的相近姿态」的帧归为一组, 只在组内比锐度。
+
+    以前是贪心首次匹配: 每帧只跟它遇到的第一个代表比, 找到就 break。
+    两个问题: ①找到代表 b, 换个顺序可能就跟 c 去了, 结果不稳;
+    ②A~B 像、B~C 像但 A~C 不像时, C 进不了 A 那组, 链式相似被拆散。
+    现在改成**并查集**: 两两判相似后合并, 最后取连通分量, 天然是传递闭包。
+
+    阈值依据 (实测一批 25 张会议/合影照, 逐对 300 个组合, 并人工核对了
+    所有成组的照片对):
+      - 旧的 ncc_min=0.80 实测**一对都过不了**(最高才 0.794), 25 张全是单张组
+      - 一度调到 0.60 太松, 结果把**换了人**的帧并进同一组
+      - 逐对量下来: 正确的对 NCC=0.905, 错误的对是 0.847 和 0.633,
+        两边区间重叠, 位置差/脸宽差/Iou 全都分不开 (正确对的位置差 0.085
+        比错误对还大)。**唯一能干净切开的只有 NCC: >=0.85 时恰好只留下
+        正确的那一对**, 所以 0.85 是这批数据的实测分界。
+      - pos_tol 保留 0.12: 它挡的是"同一画面里不同的人", 仍是最有效的一道闸
+      - iou_min 预留给需要时再开 (默认 0)。实测正确对的 IoU 只有 0.00,
+        现在开会把真对也拆掉
+    """
+    parent = list(range(len(rows)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]        # 路径压缩
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+
+    idx = [i for i, r in enumerate(rows)
+           if r.get("subject") == "face" and r.get("sig") is not None]
+    for i, j in itertools.combinations(idx, 2):
+        if _same_pose(rows[i], rows[j], pos_tol, size_tol, ncc_min,
+                      focal_tol, iou_min):
+            union(i, j)
+
+    buckets = {}
+    for i, r in enumerate(rows):
+        buckets.setdefault(find(i), []).append(r)
+    return list(buckets.values())
+
+
+def _face_iou_norm(a, b):
+    """两张照片里"主体脸框"的交并比。坐标要归一化 ——
+    _face_box 是像素, 而不同照片分辨率不一样, 直接比框面积毫无意义。"""
+    try:
+        aw, ah = [float(x) for x in a["decoded"].split("x")]     # 注意是 WxH
+        bw, bh = [float(x) for x in b["decoded"].split("x")]
+        ax, ay, aw_, ah_ = [float(v) for v in a["_face_box"]]
+        bx, by, bw_, bh_ = [float(v) for v in b["_face_box"]]
+    except Exception:                                            # noqa: BLE001
+        return 1.0
+    if not (aw and ah and bw and bh):
+        return 1.0
+    ax, ay, aw_, ah_ = ax / aw, ay / ah, aw_ / aw, ah_ / ah
+    bx, by, bw_, bh_ = bx / bw, by / bh, bw_ / bw, bh_ / bh
+    iw = min(ax + aw_, bx + bw_) - max(ax, bx)
+    ih = min(ay + ah_, by + bh_) - max(ay, by)
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    smaller = min(aw_ * ah_, bw_ * bh_)
+    return (inter / smaller) if smaller else 0.0
+
+
+def _subject_may_differ(group):
+    """这个组里"选中的那张脸"可能不是同一个人。
+
+    背景: 多脸图里我们取**最清楚**的那张脸当主体 (见 analyze())。但实测一批
+    合影, 头部锐度和次头部常常只差 1.0~1.3 倍, 也就是说主体很容易在人之间
+    跳 —— 一张选中前排路人, 下一张选中台上的人。这种组里的"眼部锐度"
+    不是同一个人的, 组内最佳/疑似模糊就不可信。
+
+    判据: 组内选中的脸框两两几乎不重叠 -> 多半换人了。
+
+    只用 IoU 这一条, 不加"多脸图过半就报"那种粗判: 实测一批 25 张合影,
+    IoU=0.79 (人工核对是同一个人) 的组也会被"多脸过半"误报, 而多脸本身
+    根本不说明主体会跳 —— 主体跳不跳取决于组内**各自选中了谁**, IoU 才是
+    直接证据。
+    """
+    if len(group) < 2:
+        return False
+    for a, b in itertools.combinations(group, 2):
+        if _face_iou_norm(a, b) < 0.30:
+            return True
+    return False
 
 
 # ==========================================================================
@@ -1006,7 +1266,7 @@ def js_str_body(s):
 # ==========================================================================
 # 分组 + 生成全部报告文件 (命令行 main() 和 GUI app.py 共用)
 # ==========================================================================
-def compute_flags(rows, groups_ncc=0.80, soft_ratio=0.55):
+def compute_flags(rows, groups_ncc=0.85, soft_ratio=0.55):
     """给 rows 打上分组/判定标记。纯计算, 不碰磁盘。
 
     GUI 直接调这个函数出结果, 不经过 write_reports —— 所以 exe 里不用写任何文件。
@@ -1023,18 +1283,25 @@ def compute_flags(rows, groups_ncc=0.80, soft_ratio=0.55):
             r["soft"] = bool(top and len(g) > 1 and r["compare_value"] < top * soft_ratio)
         if len(g) > 1:
             g[0]["best_in_group"] = True
+        # 主体可能不是同一个人 —— 见 _subject_may_differ 的说明。
+        # 命中就在界面上标出来提醒, 别让用户误以为组内锐度可以直接比。
+        risky = len(g) > 1 and _subject_may_differ(g)
+        for r in g:
+            r["subject_uncertain"] = risky
     for r in rows:
         r.setdefault("group", 0)
         r.setdefault("group_size", 1)
         r.setdefault("ratio_group", 0)
         r.setdefault("best_in_group", False)
         r.setdefault("soft", bool(r.get("_error")))
+        r.setdefault("subject_uncertain", False)
 
     return {
         "groups": groups,
         "n_soft": sum(1 for r in rows if r.get("soft")),
         "n_face": sum(1 for r in rows if r.get("faces")),
         "n_dup": sum(1 for g in groups if len(g) > 1),
+        "n_uncertain": sum(1 for r in rows if r.get("subject_uncertain")),
     }
 
 
@@ -1071,7 +1338,200 @@ def write_csv(rows, path):
             w.writerow(line)
 
 
-def write_reports(rows, folder, out_dir, full=False, groups_ncc=0.80, soft_ratio=0.55):
+# ==========================================================================
+# 分析结果缓存
+#
+# 目的: 同一批照片第二次点「开始分析」时直接读结果, 不再逐张解码 RAW。
+# 为什么不用 CSV 当中转: CSV 写的是**已格式化的字符串** (快门写成 "1/125",
+# 对焦依据写成 "眼睛"), 而界面要的是原始类型 (exposure_time 是 (1,125) 元组,
+# subject 是 "face"/"center"), 直接读会把界面显示搞坏。
+#
+# 存的必须是**原始测量值**, 不存 group/soft/best_in_group —— 那几个由
+# compute_flags() 纯计算得出, 存了反而会和 --group-ncc/--ratio 参数打架。
+# ==========================================================================
+CACHE_VERSION = 2          # 改测量逻辑就 +1, 旧缓存自动作废
+                            # v2: 选脸规则从"最大面积"改成"最清楚那张", sig 含义跟着变了
+CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+                         "cmdc_cull", "cache")
+
+THUMB_PREFIX = "data:image/jpeg;base64,"
+
+# 逐张存的字段。前两个是给过期校验用的, 其余是测量结果。
+# _face_box 必须存: _subject_may_differ() 靠它算主体脸框的 IoU 来判断
+# "组内选中的脸可能不是同一个人", 不存的话第二次读缓存就再也标不出 ⚠。
+_CACHE_FIELDS = ("eye_sharp", "face_sharp", "sharp_global", "compare_value",
+                 "subject", "faces", "face_conf", "face_w", "face_cx", "face_cy",
+                 "face_area_pct", "brightness", "clipped", "decoded",
+                 "from_preview", "_error", "_ms", "_face_boxes", "_face_box",
+                 "_eye_boxes", "_face_metrics", "subject_idx")
+# EXIF: 这些原始值是 (分子, 分母) 元组, JSON 里要转成 list, 读回再转回 tuple
+_CACHE_RATIOS = ("exposure_time", "f_number", "focal_length")
+_CACHE_PLAIN = ("iso", "focus_mode", "af_area", "af_x", "af_y",
+                "lens_model", "datetime_original")
+
+
+def cache_path(folder):
+    """缓存文件名 = 路径的 sha1, 避开中文路径和 260 字符限制。"""
+    key = os.path.abspath(folder).lower().encode("utf-8")
+    return os.path.join(CACHE_DIR, hashlib.sha1(key).hexdigest()[:20] + ".json")
+
+
+def _enc_sig(sig):
+    """人脸指纹 (64x64 float32) -> base64。分组要靠它做 NCC, 少了就全拆成单张组。"""
+    if sig is None:
+        return None
+    return base64.b64encode(np.asarray(sig, dtype=np.float32).tobytes()).decode("ascii")
+
+
+def _py(v):
+    """numpy 标量/数组 -> 纯 python 类型, 让 json 能序列化。
+
+    不做这一步的话, face_cx/face_cy/face_area_pct 这些由 numpy 算出来的
+    np.float32 会让 write_cache 对**每一张**都抛 TypeError 然后静默跳过,
+    缓存等于没写。逐个字段转, 顺手也处理 _face_boxes 这种嵌套 list。
+    """
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, (list, tuple)):
+        return [_py(x) for x in v]
+    return v
+
+
+def _dec_sig(b64):
+    if not b64:
+        return None
+    try:
+        # copy() 是必须的: frombuffer 得到的是只读视图, 后面 group_frames 不会改它,
+        # 但保持成普通 ndarray 更安全
+        return np.frombuffer(base64.b64decode(b64), dtype=np.float32).copy()
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
+def write_cache(folder, rows, full, groups_ncc=0.85, soft_ratio=0.55):
+    """把一轮分析结果落盘。失败不致命 —— 顶多下次重扫, 所以别向上抛。"""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        items = []
+        for r in rows:
+            try:
+                st = os.stat(os.path.join(folder, r["file"]))
+            except OSError:
+                continue                    # 分析完又被删掉的, 跳过
+            thumb = r.get("_thumb") or ""
+            if thumb.startswith(THUMB_PREFIX):
+                thumb = thumb[len(THUMB_PREFIX):]
+            it = {"f": r["file"], "sz": st.st_size, "mt": int(st.st_mtime),
+                  "sig": _enc_sig(r.get("sig")), "thumb": thumb}
+            for k in _CACHE_FIELDS:
+                it[k] = _py(v) if (v := r.get(k)) is not None else None
+            for k in _CACHE_RATIOS:
+                v = r.get(k)
+                it[k] = list(v) if v else None
+            for k in _CACHE_PLAIN:
+                it[k] = r.get(k)
+            items.append(it)
+        data = {"version": CACHE_VERSION, "folder": os.path.abspath(folder),
+                "full": bool(full), "groups_ncc": groups_ncc,
+                "soft_ratio": soft_ratio, "n": len(items),
+                "ts": int(time.time()), "items": items}
+        # 先写临时文件再改名, 免得中途被杀写出半个坏文件
+        dst = cache_path(folder)
+        tmp = dst + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.replace(tmp, dst)
+        return True
+    except Exception as exc:                                # noqa: BLE001
+        print(f"  [!] 缓存写不进去 ({exc}), 不影响本次结果")
+        return False
+
+
+def read_cache(folder, full, names=None):
+    """读缓存并校验。有效返回 rows (已跑过 compute_flags), 无效返回 None。
+
+    校验项 (任一不满足就当没有缓存):
+      - 文件在、能解析、version 对得上
+      - full 标志一致 (半分辨率和全分辨率的分数没有可比性)
+      - 目录里的照片集合和缓存记录的完全一致 (新增/删了照片)
+      - 每张照片现在的大小+修改时间和记录一致 (被改过)
+    """
+    path = cache_path(folder)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:                                       # noqa: BLE001
+        return None
+    if data.get("version") != CACHE_VERSION or data.get("folder") != os.path.abspath(folder):
+        return None
+    if bool(data.get("full")) != bool(full):
+        return None
+
+    items = data.get("items") or []
+    # 照片集合变了就作废: 否则新拍的那几张根本不在缓存里, 界面上会少照片
+    if names is not None:
+        if len(names) != len(items) or {n for n in names} != {it.get("f") for it in items}:
+            return None
+
+    rows = []
+    for it in items:
+        fp = os.path.join(folder, it.get("f") or "")
+        try:
+            st = os.stat(fp)
+        except OSError:
+            return None                   # 记录里的文件没了
+        if st.st_size != it.get("sz") or int(st.st_mtime) != it.get("mt"):
+            return None                   # 照片被改过
+        r = {"file": it["f"], "orig_uri": pathlib.Path(fp).as_uri(),
+             "sig": _dec_sig(it.get("sig")), "preview_rel": ""}
+        # 下面 _CACHE_FIELDS 循环会把 _face_box/_eye_boxes/_face_boxes 一起带回来
+        r["_face_box"] = it.get("_face_box")
+        r["_eye_boxes"] = it.get("_eye_boxes") or []
+        thumb = it.get("thumb") or ""
+        r["_thumb"] = THUMB_PREFIX + thumb if thumb else ""
+        for k in _CACHE_FIELDS:
+            r[k] = it.get(k)
+        for k in _CACHE_RATIOS:
+            v = it.get(k)
+            r[k] = tuple(v) if v else None
+        for k in _CACHE_PLAIN:
+            r[k] = it.get(k)
+        rows.append(r)
+
+    compute_flags(rows, groups_ncc=data.get("groups_ncc") or 0.85,
+                  soft_ratio=data.get("soft_ratio") or 0.55)
+    return rows
+
+
+def clear_cache(folder=None):
+    """删掉某个文件夹的缓存; folder 为空则全删。返回删掉几个。"""
+    n = 0
+    try:
+        if folder:
+            for p in (cache_path(folder), cache_path(folder) + ".tmp"):
+                if os.path.isfile(p):
+                    os.remove(p)
+                    n += 1
+            return n
+        if not os.path.isdir(CACHE_DIR):
+            return 0
+        for f in os.listdir(CACHE_DIR):
+            if f.endswith((".json", ".tmp")):
+                try:
+                    os.remove(os.path.join(CACHE_DIR, f))
+                    n += 1
+                except OSError:
+                    pass
+        return n
+    except OSError:
+        return n
+
+
+def write_reports(rows, folder, out_dir, full=False, groups_ncc=0.85, soft_ratio=0.55):
     """给 rows 打上分组/判定标记, 并写出 CSV / txt / HTML。返回统计数字。"""
     st = compute_flags(rows, groups_ncc=groups_ncc, soft_ratio=soft_ratio)
     groups, n_soft, n_face, n_dup = st["groups"], st["n_soft"], st["n_face"], st["n_dup"]
@@ -1205,8 +1665,10 @@ def main():
     ap.add_argument("--out", default=None, help="输出目录 (默认 <照片目录>/_cull_out)")
     ap.add_argument("--ext", default=None, help="扩展名, 逗号分隔 (默认 RAW, 自动跳过已有 RAW 的导出版)")
     ap.add_argument("--ratio", type=float, default=0.55, help="组内锐度低于最佳 x ratio 判为疑似模糊 (默认 0.55)")
-    ap.add_argument("--group-ncc", type=float, default=0.80,
-                    help="相似帧分组的严格度 0~1 (默认 0.80, 越大越严; 0.7 更宽松但可能误判)")
+    ap.add_argument("--group-ncc", type=float, default=0.85,
+                    help="相似帧分组的严格度 0~1 (默认 0.85; 这是实测能分开"
+                         "'同一个人'和'换了人'的分界, 调到 0.7~0.8 会把"
+                         "不同的人并进一组)")
     ap.add_argument("--full", action="store_true", help="全分辨率解码 (更准, 慢约 5 倍)")
     ap.add_argument("--model", default=None, help="YuNet 模型路径")
     ap.add_argument("--jobs", type=int, default=4,
@@ -1283,14 +1745,20 @@ def main():
     rows = []
     cv_threads = 1 if jobs > 1 else 0
     if jobs > 1 and len(names) > 1:
-        with ProcessPoolExecutor(max_workers=jobs, initializer=worker_init,
-                                 initargs=(model_path, args.full, preview_dir,
-                                           args.preview_size, cv_threads)) as ex:
+        with HardStopPool(max_workers=jobs, initializer=worker_init,
+                          initargs=(model_path, args.full, preview_dir,
+                                    args.preview_size, cv_threads)) as ex:
             futs = [ex.submit(process_one, n, folder) for n in names]
-            for i, f in enumerate(as_completed(futs), 1):
-                rec = f.result()
-                rows.append(rec)
-                print_progress(i, len(names), rec)
+            try:
+                for i, f in enumerate(as_completed(futs), 1):
+                    rec = f.result()
+                    rows.append(rec)
+                    print_progress(i, len(names), rec)
+            except KeyboardInterrupt:
+                # Ctrl+C: ex.__exit__ 会 terminate 掉所有 worker, 不然它们还会
+                # 接着把这批照片解码完才肯退出。
+                ex.stop()
+                raise
     else:
         worker_init(model_path, args.full, preview_dir, args.preview_size, cv_threads)
         for i, n in enumerate(names, 1):
