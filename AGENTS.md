@@ -20,12 +20,13 @@
 - 模型首次运行自动下到 **exe 同级的 `_internal\models\`**（`sys._MEIPASS/models`；源码运行=工具目录\models）
 
 ```
-cull.py     核心算法库 + 命令行入口（无 GUI 依赖，可独立使用）
-app.py      GUI 入口（pywebview 单窗口），把 cull.py 的结果渲染成网页
-ui.html     GUI 界面（原生 JS，无框架、无构建步骤）
-app.spec    PyInstaller 打包配置
-build.py    打包脚本（调 PyInstaller 的 Python API）
-run.bat     命令行启动器（拖文件夹进去即可）
+cull.py          核心算法库 + 命令行入口（无 GUI 依赖，可独立使用）
+app.py           GUI 入口（pywebview 单窗口），把 cull.py 的结果渲染成网页
+ui.html          GUI 界面（原生 JS，无框架、无构建步骤）
+ollama_advise.py 可选：调本机 Ollama 视觉模型给调色建议（独立模块，无项目内 import）
+app.spec         PyInstaller 打包配置
+build.py         打包脚本（调 PyInstaller 的 Python API）
+run.bat          命令行启动器（拖文件夹进去即可）
 ```
 
 **技术栈**：Python 3.12 + rawpy(libraw) + OpenCV(YuNet) + Pillow + pywebview/pythonnet(WebView2)
@@ -224,9 +225,11 @@ folder                 照片目录; 不给则进入交互式(可拖文件夹进
 | `export_csv` / `export_list` | 手动导出 |
 | `show_in_explorer(folder, name)` | 资源管理器里选中原文件 |
 | `open_original(folder, name)` | 用系统默认看图程序打开原图（`os.startfile`） |
+| `advise(folder, names, dest)` | **起后台线程**让 Ollama 给这批照片出调色建议（见 §7.5） |
+| `get_advice(folder)` | 取某文件夹上一次的建议结果（内存里，没跑过返回 None） |
 
 **关键常量**：`BATCH=60`（每次取多少张卡片）、`BIG_SIDE=1600`、
-`BIG_CACHE_MAX=64`（大图 LRU，约 22MB）
+`BIG_CACHE_MAX=64`（大图 LRU，约 22MB）、`MAX_IMAGES=24`（AI 调色建议每次最多发多少张）
 
 **并发模型**：一个后台线程跑 `_run_queue`，所有进展通过 `queue.Queue` 传给
 `poll()`。取消靠 `threading.Event`。`_run_id` 用来作废过期轮次的消息。
@@ -324,6 +327,79 @@ excludes=[matplotlib, scipy, pandas, PyQt5, PySide6, IPython, ...]
 | `疑似模糊.txt` | 组内被判定偏软的那些 |
 | `preview/` | 2048px 大图 JPEG |
 | `移动日志.txt` | 每次移动/复制追加记录 |
+
+---
+
+## 7.5 AI 调色建议（本地 Ollama，可选）
+
+把挑好的照片交给**本机 Ollama 的视觉模型**，让它判断这一组的整体风格并给出
+**逐张的调色微调建议**。结果只在窗口的面板里显示，**不写任何文件**。
+
+- 入口：结果页操作栏的「AI 调色建议」按钮（**只在手动点击时跑**；移动/复制文件后**不再自动触发**）；
+  面板里有「重新分析风格」可重跑。按钮会带上 `#dest`——照片可能已经搬走了，
+  得从目标目录读（`_run_advise` 先找 dest、找不到再回原目录）。
+- 数据流：`Api.advise()` 起后台线程 `_run_advise()` → 逐张 `cull.decode()` →
+  `ollama_advise.compute_color_stats()` 算客观色彩统计 + `jpeg_bytes()` 缩成 1024px JPEG
+  → `ollama_advise.analyze_images()` POST `/api/chat` → 结果经 `("advice", payload)` 消息回到面板。
+  **全程只在内存里，不落盘。**
+- 消息 tag：`("advice", payload)` / `("advice_error", (folder, msg))` / `("advice_done", folder)`。
+  ⚠ 用**独立**的 `_advice_id` 作废过期轮次，**不要**碰 `_run_id`（见 §8.4）；
+  也**别复用 `("idle","")`**，否则会误清界面的 `RUNNING`。
+- 进度与取消：`analyze_images()` 走**流式**（`stream:true`），`on_progress` 回报
+  `{chars, tail}` → `("advice_prog", {folder, phase, done, total, chars, tail})`
+  （`decode`=解码准备、`gen`=模型生成）。界面显示「已 Ns · 收到 M 字」+ 一行**实时输出**
+  （`tail`：右侧贴齐、左溢出裁掉，始终看得到最新吐出的字符）。`cancel_advise()` 置
+  `self._advice_cancel`（**独立于** `_cancel` / `_pull_cancel`）→ `("advice_cancelled", folder)`。
+  ⚠ **取消要真的立刻停**，读线程 + 看守线程 + 只 `shutdown` 不 `close` —— 见 §8.16。
+  `("advice_done", folder)` 仍在 `finally` 里兜底，界面不会卡住。
+- 模型与地址：**都可配**。**顶部栏**（一直可见，启动后不用先分析文件夹）有「Ollama 地址」输入框 + 「保存地址」按钮（写进工具目录的
+  `cull_config.json`）；模型下拉只列本地**支持视觉**的模型，旁边可「拉取」新模型。不配的话
+  默认 `127.0.0.1:11434` + `qwen2.5vl:7b`。16GB 显存下 7B~12B 的 4bit 量化模型都行。
+  **模型必须已经 `ollama pull` 过**，否则面板提示拉取。
+- **关键设计：数值来自程序，风格判断才交给模型。** `compute_color_stats()` 给的是真实
+  的 RGB 均值/分位、高光溢出、死黑、对比度、饱和度、色度、R/B 比、曝光估计；模型只负责
+  "审美判断 + 把客观数字翻译成人话"。小模型（4B~7B）**直接看图报数值不准**，别让它瞎猜。
+- 限制：一次最多发 `MAX_IMAGES=24` 张（超了均匀抽样，面板会提示）；连不上 Ollama 只弹
+  一条错误，**不影响选片主流程**；面板结果只存内存，重开程序即失。若模型没落在 GPU 上
+  （AMD/ROCm 没生效会静默回退 CPU，很慢），`check_ollama()` 会把 `gpu` 置 False，
+  面板不显示 `GPU` 标记。
+- 依赖：只用 stdlib 的 `urllib.request`（沿用 `cull.py` 里 `ensure_asset` 的既有做法），
+  **没引入 `requests`**，打包无需改 `app.spec` / `build.py`。
+
+**配置（`cull_config.json` 的 `ollama` 段）**——文件在**工具目录**（打包后=exe 同级）：
+
+```json
+{
+  "ollama": {
+    "host": "127.0.0.1", "port": 11434, "scheme": "http",
+    "model": "qwen2.5vl:7b", "max_images": 24, "timeout": 300
+  }
+}
+```
+
+- 读取顺序与 `cull.load_config()` 一致：`<工具目录>/../cull_config.json` 优先，其次
+  `<工具目录>/cull_config.json`。GUI 保存时写**已存在的那个**；都没有就写工具目录
+  （打包后=exe 同级，**绝不写进 `_MEIPASS`**）。只覆盖 `ollama` 段，`weights`/`model_dir`
+  等其它顶层键原样保留。
+- `_get_json` / `_post_json` / `pull_model` 一律走 `base_url()`（= 配置的 URL，或
+  `set_base_url()` 的运行时覆盖）。地址也支持整串 `"192.168.1.9:11434"`（缺协议补 `http`）。
+- ⚠ `cull_config.json` 含本机地址，**不进版本库**（`.gitignore` 已加）。
+
+`ollama_advise.py` 的对外接口（`app.py` 只依赖这些）：
+
+```python
+compute_color_stats(bgr) -> dict        # BGR ndarray -> 客观色彩统计 (全是 python 原生 float)
+jpeg_bytes(bgr, side=1024) -> bytes     # 缩到长边 1024 的 JPEG 字节
+check_ollama(model) -> dict             # 探测是否在跑 / 模型是否已 pull / 是否用 GPU
+list_models() -> dict                   # 本机支持视觉的模型列表 (按名字排序)
+pull_model(model, on_progress, cancel) -> dict   # 流式拉取模型 (NDJSON 进度)
+analyze_images(images, stats, model) -> dict     # POST /api/chat, 返回校验后的建议 dict
+get_settings() / save_settings(s) -> dict        # 读 / 存 Ollama 地址等配置
+default_model() / max_images() / request_timeout() -> 标量
+```
+
+`analyze_images` 优先用 Ollama ≥0.5.0 的结构化输出（`format=<JSON Schema>`），老版本
+不认 schema 会回 HTTP 400，此时自动退回 `format="json"` 再试一次。
 
 ---
 
@@ -483,6 +559,25 @@ cmd.exe 读 .bat 时按控制台代码页解析，里面写中文会被拆成乱
 
 `os.path.commonpath` 在 `F:\` 和 `C:\` 之间会抛 `ValueError`。
 `do_move()` 先比盘符再算公共路径。搬到别的盘是支持的。
+
+### 8.16 取消 Ollama 流式请求**不能**靠 `resp.close()`
+
+Windows 上 `BufferedReader.readline` 阻塞时**持有缓冲区锁**；从另一个线程调
+`resp.close()` 会去等这把锁 —— 于是**"取消"自己反而被卡住**，要等读线程结束（对端把
+连接关掉）才返回。实测一个 `sleep 30s` 不吐字的 mock 服务端，把取消延迟从应得的
+0.4s **拖到了 30.01s**，看起来就像"点了取消还在跑"。
+
+正确做法（`ollama_advise._chat_stream`）：
+
+1. 阻塞读取放**独立 daemon 线程**（`_read`），调用线程**不直接趴在网络上**；
+2. 调用线程每 50ms `finished.wait(0.05)` 醒一次，`cancel` 置位就
+   `raise RuntimeError("已取消")`（`finished` 由 `_read` 的 `finally` 置位，看守线程据此退出）；
+3. `_abort()` **只**对底层 socket `shutdown(SHUT_RDWR)`（不碰缓冲区锁，立刻返回，同时让
+   服务端察觉断开而停止生成 token），**绝不调 `resp.close()`**。残留的读线程是 daemon，
+   连接一断就自己结束。
+
+实测取消延迟 **0.06s**。`on_progress` 同时回传 `tail`（末尾约 160 字符、换行压成空格），
+界面用它做一行实时输出。
 
 ---
 

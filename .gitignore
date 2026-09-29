@@ -18,6 +18,9 @@ _cull_out/
 # 首次运行自动下载的模型 (~128MB): 关键点 / MUSIQ / NIMA
 models/
 
+# 用户本地配置 (Ollama 地址/端口等, 因人而异, 不进版本库)
+cull_config.json
+
 # Python 缓存
 __pycache__/
 *.pyc
@@ -34,3 +37,4 @@ desktop.ini
 # agent 工具的本地缓存 (不进版本库)
 .codegraph/
 .commandcode/
+.omo/

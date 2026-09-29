@@ -44,6 +44,43 @@
   /* ---- 操作栏 ---- */
   #act{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
   #dest{font-family:Consolas,monospace;font-size:12.5px}
+  /* Ollama 地址 / 模型选择 / 拉取: 放在顶部栏, 启动后就能配 (不用先分析文件夹) */
+  #ollamaCfg{margin-top:10px;padding-top:10px;border-top:1px solid #2e2e36;
+             display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  #advModel{max-width:240px}
+  #advHost{width:160px}
+  #advPullName{width:200px}
+  #advProg{font-size:12px}
+  #advRun{font-size:12px}
+  /* AI 实时输出: 单行; 外层右对齐, 文字比框宽时从左侧裁掉 -> 始终看到最新吐出的字符 */
+  #advOut{flex:1 1 200px;min-width:140px;max-width:720px;overflow:hidden;
+          display:flex;justify-content:flex-end}
+  #advOutText{white-space:nowrap;font-family:Consolas,monospace;font-size:12px;color:#9a9aa2}
+
+  /* ---- AI 调色建议面板 ---- */
+  #advice{background:#202024;border-bottom:1px solid #2e2e36;padding:10px 16px;
+          max-height:340px;overflow:auto}
+  .advhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:7px}
+  .advhead .sp{flex:1}
+  .advhead b{font-size:13.5px}
+  .advmodel{font-size:12px}
+  .advtag{font-size:11px;padding:1px 7px;border-radius:99px;background:#3a3a42;color:#bbb}
+  .advstyle{background:#17171a;border:1px solid #2e2e36;border-radius:8px;
+            padding:7px 10px;font-size:12.5px;color:#c9c9d2;margin-bottom:8px}
+  .advcols{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px}
+  .advcol{flex:1;min-width:260px;background:#242429;border-radius:8px;padding:7px 10px}
+  .advh{font-size:12px;color:#8f8f99;margin-bottom:3px}
+  .advcol ul{margin:0;padding-left:18px;font-size:12.5px}
+  .advcol li{margin:2px 0}
+  .advnote{font-size:12px;color:#f0c674;margin-bottom:7px}
+  .advtable{width:100%;border-collapse:collapse;font-size:12px}
+  .advtable th{text-align:left;color:#8f8f99;font-weight:600;white-space:nowrap;
+               padding:3px 8px 4px 0;border-bottom:1px solid #2e2e36}
+  .advtable td{padding:3px 8px 3px 0;border-bottom:1px solid #232329;vertical-align:top}
+  .advtable tr:last-child td{border-bottom:none}
+  .advname{font-family:Consolas,monospace;color:#c9c9d2}
+  .advnum{color:#7fd1a8;white-space:nowrap;text-align:right}
+  .advreason{color:#a9a9b2;min-width:220px;max-width:460px}
 
   /* ---- 卡片 ---- */
   #grid{padding:4px 0 16px}
@@ -118,6 +155,18 @@
     <div class="sp"></div>
     <span class="muted" style="font-size:12px">结果只在这个窗口里看, 不写照片文件夹</span>
   </div>
+  <div id="ollamaCfg">
+    <span class="muted" style="font-size:12px">Ollama</span>
+    <input type="text" id="advHost" placeholder="127.0.0.1:11434" spellcheck="false" title="Ollama 服务地址 (主机:端口, 也可带 http:// 前缀)">
+    <button id="bAdvSave" title="保存 Ollama 地址到工具目录的 cull_config.json">保存地址</button>
+    <select id="advModel" title="选择用于调色建议的本地 Ollama 视觉模型">
+      <option value="" disabled selected>正在读取模型…</option>
+    </select>
+    <button id="bAdvRefresh" title="重新读取本机 Ollama 已安装的视觉模型">刷新模型</button>
+    <input type="text" id="advPullName" placeholder="拉取模型, 如 qwen2.5vl:7b" spellcheck="false">
+    <button id="bAdvPull" title="向本机 Ollama 下载这个视觉模型 (可能几个 GB, 请耐心等进度)">拉取</button>
+    <span id="advProg" class="muted"></span>
+  </div>
   <div id="folders"></div>
   <div id="status">就绪 — 先选文件夹, 再点「开始分析」</div>
 </div>
@@ -161,8 +210,14 @@
     <button id="bMove" class="pri" disabled>把勾选的移过去</button>
     <button id="bExpCsv">导出 CSV…</button>
     <button id="bExpList">导出勾选清单…</button>
+    <button id="bAdvise" title="用本地 Ollama 视觉模型看勾选的照片, 给出整组风格判断和逐张调色参数建议">AI 调色建议</button>
+    <span id="advRun" class="muted"></span>
+    <span id="advOut" title="AI 实时输出"><span id="advOutText"></span></span>
+    <button id="bAdvCancel" class="pri" style="display:none" title="中止这次 AI 调色建议 (照片和结果不受影响)">取消 AI</button>
   </div>
 </div>
+
+<div id="advice" style="display:none"></div>
 
 <div class="legend">
   <span class="sw" style="background:#27ae60"></span>组内最清晰 &nbsp;&nbsp;
@@ -413,6 +468,61 @@ function handleMsgs(msgs){
           : '就绪 — 先选文件夹, 再点「开始分析」';
       updateRun();
     }
+    else if (m[0] === 'advice') { advStop(); renderAdvice(m[1]); }
+    else if (m[0] === 'advice_error') {
+      advStop();
+      setAdvBusy(false);
+      say((m[1] && m[1][1]) || 'AI 调色建议失败', true);
+    }
+    else if (m[0] === 'advice_done') { if (ADV_RUNNING) advStop(); else setAdvBusy(false); }
+    else if (m[0] === 'advice_prog') {
+      // {folder, phase, done, total, chars}; 解码阶段显示"准备图片 N/M"
+      var ap = m[1] || {};
+      ADV_CHARS = ap.chars || ADV_CHARS;
+      if (ap.phase === 'decode' && ap.total){
+        var apEl = $('advRun');
+        if (apEl) apEl.textContent = '准备图片 ' + ap.done + '/' + ap.total + '…';
+      }
+      if (ap.tail) { var o=$('advOutText'); if(o) o.textContent = ap.tail; }
+    }
+    else if (m[0] === 'advice_cancelled') {
+      advStop();
+      var acEl = $('advRun'); if (acEl) acEl.textContent = '';
+      say('已取消 AI 调色建议');
+    }
+    else if (m[0] === 'pull') {
+      // {model, status, pct, completed, total}; pct 为 null 时只有文字状态
+      var p = m[1] || {};
+      var txt = '拉取 ' + (p.model || '') + ': ';
+      if (p.pct === null || p.pct === undefined || isNaN(Number(p.pct))){
+        txt += (p.status || '…');
+      } else {
+        txt += (Math.round(Number(p.pct) * 10) / 10) + '%';
+      }
+      $('advProg').textContent = txt;
+    }
+    else if (m[0] === 'pull_done') {
+      // 先取出值: m 是 for 循环里的 var, 异步回调执行时它已经指向别处了
+      var doneModel = m[1];
+      setAdvPullBusy(false);
+      $('advProg').textContent = '';
+      say('模型拉取完成: ' + doneModel);
+      // 刷新列表并把刚拉好的那个选中 (loadModels 是异步的, 等它填完再选)
+      loadModels().then(function(){
+        var sel = $('advModel');
+        if (!sel || !doneModel) return;
+        for (var j = 0; j < sel.options.length; j++){
+          if (sel.options[j].value === doneModel){ sel.value = doneModel; break; }
+        }
+      });
+    }
+    else if (m[0] === 'pull_error') {
+      // [model, message]
+      var pe = m[1] || [];
+      setAdvPullBusy(false);
+      $('advProg').textContent = '';
+      say(pe[1] || '模型拉取失败', true);
+    }
   }
 }
 
@@ -423,6 +533,7 @@ function resetView(){
   $('bar').style.display = 'none';
   $('empty').style.display = '';
   $('empty').textContent = '先在上面选一个照片文件夹, 然后点「开始分析」。';
+  clearAdvice();
 }
 
 async function openFolder(folder){
@@ -436,6 +547,12 @@ async function openFolder(folder){
   } catch(e){
     $('empty').textContent = '载入失败: ' + e;
   }
+  // 这个文件夹之前算过 AI 调色建议的话, 直接恢复显示 (没有则收起面板)
+  try {
+    var a = await api.get_advice(folder);
+    if (CUR !== folder) return;          // 等结果期间用户切走了文件夹, 别贴错面板
+    if (a) renderAdvice(a); else clearAdvice();
+  } catch(e){ clearAdvice(); }
 }
 
 /* 换排序要重新从头拉一遍 —— 后端是按 offset 分页的, 顺序变了不能续着接 */
@@ -525,6 +642,7 @@ function applyBatch(d, append){
   }
 
   $('bar').style.display = '';
+  if (!ADV_MODELS_OK) loadModels();   // 操作栏第一次露出来时补一次; 成功读到过就不再重复
   $('empty').style.display = TOTAL ? 'none' : '';
 
   // AF 区域下拉只填一次
@@ -855,10 +973,331 @@ $('bExpList').onclick = async function(){
   else say((r && r.error) || '导出失败', true);
 };
 
+/* ================= AI 调色建议 ================= */
+var ADV_BUSY = false;   // 正在等后端 / Ollama 返回
+var ADV_KEYS = [
+  ['exposure', '曝光'], ['temperature', '色温'], ['contrast', '对比'],
+  ['highlights', '高光'], ['shadows', '阴影'], ['saturation', '饱和'],
+  ['vibrance', '鲜艳度']
+];
+
+function setAdvBusy(on){
+  ADV_BUSY = !!on;
+  var b = $('bAdvise'); if (b) b.disabled = ADV_BUSY;
+  var r = $('bAdvRerun'); if (r) r.disabled = ADV_BUSY;
+}
+
+/* ---- 实时进度 + 中止 ----
+   计时用递归 setTimeout (和本文件的轮询约定一致, 不能用 setInterval):
+   每次 tick 排下一次, advStop 清掉待定的 timer, 保证不泄漏也不叠加。 */
+var ADV_START = 0, ADV_CHARS = 0, ADV_TIMER = null, ADV_RUNNING = false;
+
+function advTick(){
+  if (!ADV_RUNNING) return;
+  var el = $('advRun');
+  if (el){
+    var txt = '已 ' + Math.floor((Date.now() - ADV_START) / 1000) + 's';
+    if (ADV_CHARS > 0) txt += ' · 收到 ' + ADV_CHARS + ' 字';
+    el.textContent = txt;   // 全是本地数值, 不用 innerHTML
+  }
+  ADV_TIMER = setTimeout(advTick, 1000);
+}
+
+function advStart(){
+  // 防重入: 万一上一次的 timer 还在, 先清掉再开新的, 绝不让两个 tick 链并存
+  if (ADV_TIMER){ clearTimeout(ADV_TIMER); ADV_TIMER = null; }
+  var ot = $('advOutText'); if (ot) ot.textContent = '';   // 清掉上一轮残留的实时输出
+  ADV_START = Date.now();
+  ADV_CHARS = 0;
+  ADV_RUNNING = true;
+  var b = $('bAdvCancel'); if (b) b.style.display = '';
+  setAdvBusy(true);
+  advTick();                   // 立刻显示"已 0s", 不用等第一秒
+}
+
+function advStop(){
+  if (ADV_TIMER){ clearTimeout(ADV_TIMER); ADV_TIMER = null; }
+  ADV_RUNNING = false;
+  var ot = $('advOutText'); if (ot) ot.textContent = '';
+  var b = $('bAdvCancel'); if (b) b.style.display = 'none';
+  var el = $('advRun'); if (el) el.textContent = '';
+  setAdvBusy(false);
+}
+
+/* ---- 模型下拉 / 拉取 ---- */
+var ADV_MODELS_OK = false;      // 成功读到过模型列表; 空列表或读失败时保持 false, 允许再自动试一次
+var ADV_MODELS_LOADING = false; // 防重入: 下拉可能被「刷新模型」和自动加载同时触发
+var ADV_PULL_BUSY = false;      // 拉取中: 等 pull_done / pull_error 才放开按钮
+
+function setAdvPullBusy(on){
+  ADV_PULL_BUSY = !!on;
+  var b = $('bAdvPull'); if (b) b.disabled = ADV_PULL_BUSY;
+}
+
+function advSelClear(sel){
+  while (sel.firstChild) sel.removeChild(sel.firstChild);
+}
+
+function advSelPlaceholder(sel, text){
+  advSelClear(sel);
+  var o = document.createElement('option');
+  o.value = '';
+  o.disabled = true;
+  o.selected = true;
+  o.textContent = text;
+  sel.appendChild(o);
+}
+
+/* 读本机 Ollama 已安装的视觉模型填进 #advModel。
+   模型名/参数大小是外部字符串, 全部走 createElement/textContent, 绝不用 innerHTML。 */
+async function loadModels(){
+  var sel = $('advModel');
+  if (!sel || ADV_MODELS_LOADING) return;
+  ADV_MODELS_LOADING = true;
+  var prev = sel.value;
+  sel.disabled = true;
+  advSelPlaceholder(sel, '正在读取本地模型…');
+  try {
+    var r = await api.list_models();
+    var models = (r && r.ok && r.models) ? r.models : [];
+    advSelClear(sel);
+    if (models.length){
+      models.forEach(function(m){
+        var o = document.createElement('option');
+        o.value = String(m.name);
+        var extra = '';
+        if (m.parameter_size) extra = ' (' + String(m.parameter_size) + ')';
+        else if (m.size) extra = ' (' + (Math.round(m.size / 1073741824 * 10) / 10) + 'GB)';
+        o.textContent = String(m.name) + extra;
+        sel.appendChild(o);
+      });
+      // 还选着原来那个就保持选中, 否则回到第一项
+      var keep = false;
+      for (var i = 0; i < sel.options.length; i++)
+        if (sel.options[i].value === prev) keep = true;
+      if (keep) sel.value = prev;
+      ADV_MODELS_OK = true;
+    } else {
+      advSelPlaceholder(sel, '（没有本地视觉模型, 请先拉取）');
+      ADV_MODELS_OK = false;
+      if (r && r.error) say(r.error, true);
+    }
+  } catch(e){
+    advSelPlaceholder(sel, '（读取模型列表失败, 点「刷新模型」重试）');
+    ADV_MODELS_OK = false;
+    say('获取模型列表失败: ' + e, true);
+  }
+  sel.disabled = false;
+  ADV_MODELS_LOADING = false;
+}
+
+async function pullModel(){
+  var name = $('advPullName').value.trim();
+  if (!name) return say('先填要拉取的模型名, 例如 qwen2.5vl:7b', true);
+  if (ADV_PULL_BUSY) return;
+  if (!confirm('将向本机 Ollama 拉取模型 ' + name + ', 可能下载数 GB, 确定继续?')) return;
+  setAdvPullBusy(true);
+  $('advProg').textContent = '拉取 ' + name + ': 正在开始…';
+  say('开始拉取 ' + name + ' …');
+  try {
+    var r = await api.pull_model(name);
+    if (r && r.error){
+      // 后端明确拒绝时一般不会再发 pull_error, 这里先把按钮放开
+      setAdvPullBusy(false);
+      $('advProg').textContent = '';
+      say(r.error, true);
+    }
+    // 成功的话进度走 poll 消息, 按钮等 pull_done / pull_error 再放开
+  } catch(e){
+    setAdvPullBusy(false);
+    $('advProg').textContent = '';
+    say('拉取请求失败: ' + e, true);
+  }
+}
+
+/* ---- Ollama 服务地址 (保存进工具目录的 cull_config.json) ---- */
+var ADV_SETTINGS_LOADED = false;  // waitApi 可能被触发不止一次, 地址只回填一次
+
+/* 启动时读回后端保存的地址填进 #advHost; 读不到就静默忽略, 不在启动时弹错 */
+async function loadOllamaSettings(){
+  if (ADV_SETTINGS_LOADED) return;
+  ADV_SETTINGS_LOADED = true;
+  try {
+    var s = await api.get_ollama_settings();
+    if (!s || !s.url) return;
+    var el = $('advHost');
+    if (el) el.value = String(s.url).replace(/\/+$/, '');
+  } catch(e){ /* 桥/后端还没就绪, 用户也可以手动填, 不打扰 */ }
+}
+
+async function saveOllamaSettings(){
+  var b = $('bAdvSave');
+  var url = $('advHost').value.trim();
+  if (!url) return say('请填 Ollama 地址, 例如 127.0.0.1:11434', true);
+  if (b) b.disabled = true;
+  try {
+    var r = await api.save_ollama_settings({url: url});
+    if (r && r.ok){
+      say('已保存 Ollama 地址: ' + ((r.settings && r.settings.url) || url));
+      loadModels();   // 服务器可能变了, 按新地址重读模型下拉
+    } else {
+      say((r && r.error) || '保存 Ollama 地址失败', true);
+    }
+  } catch(e){
+    say('保存 Ollama 地址失败: ' + e, true);
+  } finally {
+    if (b) b.disabled = false;
+  }
+}
+
+function mkEl(tag, cls, text){
+  var d = document.createElement(tag);
+  if (cls) d.className = cls;
+  if (text !== undefined && text !== null) d.textContent = String(text);
+  return d;
+}
+
+function clearAdvice(){
+  var box = $('advice');
+  if (!box) return;
+  box.style.display = 'none';
+  box.innerHTML = '';
+}
+
+/* 调整量带正负号; 模型偶尔会回非数字字符串, 原样显示但先转成文本 */
+function fmtAdj(v){
+  if (v === null || v === undefined || v === '') return '—';
+  var n = Number(v);
+  if (!isFinite(n)) return String(v);
+  return (n > 0 ? '+' : '') + String(Math.round(n * 100) / 100);
+}
+
+function advList(title, arr){
+  var w = mkEl('div', 'advcol');
+  w.appendChild(mkEl('div', 'advh', title));
+  var ul = document.createElement('ul');
+  var items = (arr || []).filter(function(t){
+    return t !== null && t !== undefined && String(t).trim() !== '';
+  });
+  if (!items.length){
+    ul.appendChild(mkEl('li', 'muted', '（无）'));
+  } else {
+    items.forEach(function(t){ ul.appendChild(mkEl('li', '', String(t))); });
+  }
+  w.appendChild(ul);
+  return w;
+}
+
+/* 面板里的每个字符串都可能是模型输出, 全部走 createElement/textContent, 绝不用 innerHTML */
+function renderAdvice(payload){
+  var box = $('advice');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!payload){ box.style.display = 'none'; return; }
+
+  var adv = payload.advice || {};
+
+  var head = mkEl('div', 'advhead');
+  head.appendChild(mkEl('b', '', 'AI 调色建议'));
+  if (payload.model) head.appendChild(mkEl('span', 'muted advmodel', '模型: ' + payload.model));
+  if (payload.gpu) head.appendChild(mkEl('span', 'advtag', 'GPU'));
+  head.appendChild(mkEl('div', 'sp'));
+  var rerun = mkEl('button', 'op', '重新分析风格');
+  rerun.id = 'bAdvRerun';
+  rerun.title = '对当前勾选的照片重新跑一次 AI 调色建议';
+  // 带上 #dest: 照片多半已经被搬过去了, 得从目标目录找 (app 会先找 dest 再回原目录)
+  rerun.onclick = function(){ runAdvise(selNames(), $('dest').value.trim()); };
+  rerun.disabled = ADV_BUSY;
+  head.appendChild(rerun);
+  box.appendChild(head);
+
+  if (payload.ok === false){
+    box.appendChild(mkEl('div', 'advstyle',
+      payload.error ? String(payload.error) : 'AI 调色建议失败'));
+    box.style.display = 'block';
+    return;
+  }
+
+  if (adv.group_style) box.appendChild(mkEl('div', 'advstyle', String(adv.group_style)));
+
+  var cols = mkEl('div', 'advcols');
+  cols.appendChild(advList('存在的问题', adv.issues));
+  cols.appendChild(advList('修改建议', adv.suggestions));
+  box.appendChild(cols);
+
+  if (payload.sampled){
+    var nsent = (payload.sent === null || payload.sent === undefined) ? '?' : payload.sent;
+    var ntotal = (payload.total === null || payload.total === undefined) ? '?' : payload.total;
+    box.appendChild(mkEl('div', 'advnote', '已按比例抽取 ' + nsent + ' / ' + ntotal + ' 张送模型'));
+  }
+
+  var imgs = adv.images || [];
+  if (imgs.length){
+    var t = document.createElement('table');
+    t.className = 'advtable';
+    var thead = document.createElement('thead');
+    var htr = document.createElement('tr');
+    htr.appendChild(mkEl('th', '', '文件'));
+    ADV_KEYS.forEach(function(k){ htr.appendChild(mkEl('th', 'advnum', k[1])); });
+    htr.appendChild(mkEl('th', '', '理由'));
+    thead.appendChild(htr);
+    t.appendChild(thead);
+    var tb = document.createElement('tbody');
+    imgs.forEach(function(im){
+      var tr = document.createElement('tr');
+      tr.appendChild(mkEl('td', 'advname',
+        (im.name === null || im.name === undefined) ? '' : im.name));
+      ADV_KEYS.forEach(function(k){ tr.appendChild(mkEl('td', 'advnum', fmtAdj(im[k[0]]))); });
+      tr.appendChild(mkEl('td', 'advreason',
+        (im.reason === null || im.reason === undefined) ? '' : im.reason));
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb);
+    box.appendChild(t);
+  }
+  box.style.display = 'block';
+}
+
+async function runAdvise(names, dest){
+  if (!CUR) return;
+  if (!names || !names.length) return say('还没有勾选照片', true);
+  say('正在请求 AI 调色建议…');
+  advStart();   // 显示计时/收字数 + 「取消 AI」; 终态由 poll 分支 advStop
+  try {
+    var r = await api.advise(CUR, names, dest, ($('advModel').value || ''));
+    if (r && r.error){
+      // 后端明确报错时一般不会再发 advice_done, 这里先把按钮放开
+      setAdvBusy(false);
+      say(r.error, true);
+    }
+  } catch(e){
+    setAdvBusy(false);
+    say('请求失败: ' + e, true);
+  }
+}
+
+// 同样带上 #dest: 照片可能已经搬走, 从目标目录读 (没填就回原照片目录)
+$('bAdvise').onclick = function(){ runAdvise(selNames(), $('dest').value.trim()); };
+// 中止进行中的 AI 调色建议: 只置后端的取消标志, 解码循环/流式读取自己会停;
+// 界面靠 advice_cancelled / advice_done 这两个 poll 消息收尾 (不在这里 advStop)
+$('bAdvCancel').onclick = async function(){
+  try {
+    await api.cancel_advise();
+    say('正在取消…');
+  } catch(e){
+    say('取消失败: ' + e, true);
+  }
+};
+$('bAdvRefresh').onclick = function(){ loadModels(); };
+$('bAdvSave').onclick = saveOllamaSettings;
+$('bAdvPull').onclick = pullModel;
+
 /* pywebview 的桥比页面脚本晚一点就位, 装好了再启动轮询 */
 function waitApi(){
   if (window.pywebview && window.pywebview.api){
     api = window.pywebview.api;
+    if (!ADV_MODELS_OK) loadModels();   // 桥一就位就把模型下拉填上 (读不到也不影响别的)
+    loadOllamaSettings();               // 顺带读回后端保存的 Ollama 地址 (失败静默)
     syncQueue();
     if (!pollStarted) startPolling();
     return;

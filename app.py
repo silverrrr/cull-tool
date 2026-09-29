@@ -32,12 +32,20 @@ if not getattr(sys, "frozen", False):
 import webview
 
 import cull  # 本地模块, 打包时会被一起收进去
+import ollama_advise  # 本地模块: 调本机 Ollama 出调色建议 (可能连不上, 要能容错)
 
 APP_TITLE = "选图工具"
 UI_HTML = os.path.join(HERE, "ui.html")
 BATCH = 60                # 每次从 Python 拿多少张卡片 (缩略图 base64, 太多会卡)
 BIG_SIDE = 1600           # 点开看的大图最长边
 BIG_CACHE_MAX = 64        # 大图内存 LRU 上限, 约 22MB
+
+
+def _even_indices(n, k):
+    """从 0..n-1 里均匀挑 k 个下标, 保留顺序、含首尾。"""
+    if k >= n:
+        return list(range(n))
+    return sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
 
 
 # ==========================================================================
@@ -61,6 +69,12 @@ class Api:
         self._jobs = ThreadPoolExecutor(max_workers=4)   # 大图解码
         self._model = None
         self._run_id = 0                # 每跑一轮 +1, 用来作废旧任务的消息
+        self.advice = {}                # folder -> 调色建议 payload
+        self._advice_id = 0             # 每问一次 +1, 用来作废过期的建议任务
+        self._advice_cancel = threading.Event()  # 调色建议的取消标志 (独立于 _cancel / _pull_cancel)
+        self.advice_model = ollama_advise.default_model()  # 当前选用的调色建议模型 (跟随本地配置)
+        self._pull_cancel = threading.Event()             # 拉模型时的取消标志 (独立于 _cancel)
+        self._pulling = False                             # 是否正在后台拉取模型
         self._cancel = threading.Event()
         self._pool_lock = threading.Lock()
         self._pool = None               # 当前这轮的进程池, 取消时要 terminate 掉
@@ -128,6 +142,7 @@ class Api:
         # 那样它就不会发 idle, 界面会一直等在"分析中"。
         # queue_dirs 一个都不动, 由 _run_queue 退出时把没跑完的放回去。
         self._cancel.set()
+        self._advice_id += 1            # 作废在跑的调色建议任务 (和 _run_id 分开)
         self._kill_pool()
         self.state.clear()
         self.done_dirs.clear()
@@ -518,6 +533,187 @@ class Api:
             return {"ok": True}
         except Exception as exc:                              # noqa: BLE001
             return {"ok": False, "error": str(exc)}
+
+    # ---- AI 调色建议 ----
+    def advise(self, folder, names=None, dest=None, model=None):
+        """起后台线程让本机 Ollama 给这批照片出调色建议, 立即返回。
+
+        names 为空时默认分析该文件夹里全部照片。dest 给了就先从 dest 找文件
+        (照片可能已经搬过去了), 找不到再回原目录; 都找不到的会被跳过。
+        model 不传则沿用界面上一次选的 (self.advice_model)。
+        Ollama 连不上只会推一条错误消息, 不影响别的功能。
+        """
+        rows = self.state.get(folder)
+        if not names:
+            names = [r["file"] for r in (rows or []) if r.get("file")]
+        if not names:
+            return {"ok": False, "error": "这个文件夹还没分析"}
+        model = (model or self.advice_model or ollama_advise.default_model())
+        self.advice_model = model
+        self._advice_cancel.clear()     # 新一轮开始, 清掉上一次可能留下的取消标志
+        self._advice_id += 1
+        aid = self._advice_id
+        threading.Thread(target=self._run_advise,
+                         args=(folder, list(names), dest, model, aid),
+                         daemon=True).start()
+        return {"ok": True, "n": len(names)}
+
+    def cancel_advise(self):
+        """请求中止当前调色建议任务。
+
+        只置 _advice_cancel 标志: 后台线程会在解码循环 / 流式读取时停下,
+        走 _run_advise 的 finally 发出 advice_done, 界面不会卡在"分析中"。
+        """
+        self._advice_cancel.set()
+        return {"ok": True}
+
+
+    def get_advice(self, folder):
+        """取某个文件夹上一次的调色建议结果 (没跑过则 None)。"""
+        return self.advice.get(folder)
+
+    def get_ollama_settings(self):
+        """读本机 Ollama 的本地配置 (host/port/model/max_images 等), 薄代理。
+
+        只读本地配置文件, 不联网, Ollama 没启动也能安全调用。
+        """
+        return ollama_advise.get_settings()
+
+    def save_ollama_settings(self, settings):
+        """保存 Ollama 配置 (如 {"url": "127.0.0.1:11434"}), 薄代理。
+
+        只写本地配置文件, 不联网。返回 ollama_advise.save_settings() 的结果。
+        """
+        return ollama_advise.save_settings(settings or {})
+
+    def _run_advise(self, folder, names, dest, model, aid):
+        """后台线程: 解码 -> 算色料统计 -> 发给 Ollama -> 推结果。
+
+        全程不写盘, 只把图片编码进内存; 单张坏了跳过不影响整批。
+        """
+        try:
+            st = ollama_advise.check_ollama(model)
+            if not st.get("ok"):
+                self.q.put(("advice_error", (folder, st.get("error", "Ollama 不可用"))))
+                return
+
+            # 解析文件路径: 优先 dest (已搬过去的), 否则回原目录
+            paths = []
+            for name in names:
+                p = os.path.join(folder, name)
+                if dest and os.path.isfile(os.path.join(dest, name)):
+                    p = os.path.join(dest, name)
+                if os.path.isfile(p):
+                    paths.append((name, p))
+
+            images, stats = [], []
+            n_paths = len(paths)
+            for i, (name, path) in enumerate(paths, 1):
+                if self._advice_cancel.is_set():              # 用户点了取消, 立刻停
+                    self.q.put(("advice_cancelled", folder))
+                    return
+                try:
+                    bgr, _ = cull.decode(path)
+                    s = ollama_advise.compute_color_stats(bgr)
+                    s["name"] = name
+                    images.append(ollama_advise.jpeg_bytes(bgr, 1024))
+                    stats.append(s)
+                    self.q.put(("log", f"[{i}/{n_paths}] 已准备 {name}"))
+                    self.q.put(("advice_prog", {"folder": folder, "phase": "decode",
+                                                "done": i, "total": n_paths, "chars": 0,
+                                                "tail": ""}))
+                except Exception as exc:                      # noqa: BLE001
+                    self.q.put(("log", f"[{i}/{n_paths}] 跳过 {name}: {exc}"))
+
+            if not images:
+                self.q.put(("advice_error", (folder, "没有可发送的照片")))
+                return
+
+            total = len(images)
+            max_images = ollama_advise.max_images()           # 每次都读配置, 改完设置不用重启
+            sampled = total > max_images
+            if sampled:
+                idx = _even_indices(total, max_images)
+                images = [images[i] for i in idx]
+                stats = [stats[i] for i in idx]
+            sent = len(images)
+
+            self.q.put(("log", f"正在请求 Ollama ({model}), 共 {sent} 张…"))
+
+            def on_progress(d):
+                # 流式生成进度: 回报已产出字符数 + 最近一段原文, 界面用一行实时显示
+                self.q.put(("advice_prog", {"folder": folder, "phase": "gen",
+                                            "done": 0, "total": 0,
+                                            "chars": d.get("chars", 0),
+                                            "tail": d.get("tail", "")}))
+
+            advice = ollama_advise.analyze_images(images, stats, model=model,
+                                                  on_progress=on_progress,
+                                                  cancel=self._advice_cancel)
+
+            if aid != self._advice_id:                        # 已经是过期的任务了
+                return
+            payload = {"folder": folder, "model": model, "ok": True,
+                       "advice": advice, "stats": stats, "sent": sent,
+                       "total": total, "sampled": sampled, "gpu": st.get("gpu")}
+            self.advice[folder] = payload
+            self.q.put(("advice", payload))
+        except Exception as exc:                              # noqa: BLE001
+            if self._advice_cancel.is_set():
+                # 取消导致的异常 (如 analyze_images 抛 RuntimeError("已取消")) 不算错误
+                self.q.put(("advice_cancelled", folder))
+            else:
+                self.q.put(("advice_error", (folder, str(exc))))
+        finally:
+            self.q.put(("advice_done", folder))
+
+    # ---- 模型选择 / 拉取 ----
+    def list_models(self):
+        """把本机 Ollama 已有的模型列出来, 供界面下拉选择 (薄代理)。"""
+        return ollama_advise.list_models()
+
+    def pull_model(self, model):
+        """后台拉取一个模型, 立即返回; 已经在拉就拒绝。"""
+        if not isinstance(model, str) or not model.strip():
+            return {"ok": False, "error": "模型名不能为空"}
+        model = model.strip()
+        if self._pulling:
+            return {"ok": False, "error": "正在拉取中"}
+        self._pull_cancel.clear()
+        self._pulling = True
+        threading.Thread(target=self._run_pull, args=(model,), daemon=True).start()
+        return {"ok": True, "model": model}
+
+    def cancel_pull(self):
+        """请求中止当前拉取。后台线程会在下一个进度块停下 (只丢内存, 不动已下好的部分)。"""
+        self._pull_cancel.set()
+        return {"ok": True}
+
+    def _run_pull(self, model):
+        """后台线程: 流式拉模型, 把进度推给界面。绝不向外抛异常。"""
+        # 节流状态只活在这个线程里: 百分比涨够 1 个点 / 状态变了 / 没有总量信息时才推
+        last = {"pct": None, "status": None}
+
+        def on_progress(d):
+            status = d.get("status") or ""
+            total = d.get("total")
+            completed = d.get("completed")
+            pct = round(completed / total * 100, 1) if (total and completed) else None
+            if (pct is None or status != last["status"]
+                    or last["pct"] is None or pct - last["pct"] >= 1.0):
+                last["pct"] = pct
+                last["status"] = status
+                self.q.put(("pull", {"model": model, "status": status, "pct": pct,
+                                     "completed": completed, "total": total}))
+
+        try:
+            ollama_advise.pull_model(model, on_progress=on_progress,
+                                     cancel=self._pull_cancel)
+            self.q.put(("pull_done", model))
+        except Exception as exc:                          # noqa: BLE001
+            self.q.put(("pull_error", (model, str(exc))))
+        finally:
+            self._pulling = False
 
     # ---- 移动 ----
     def move(self, folder, names, dest, copy=False, with_jpg=False, preview_dir=""):
