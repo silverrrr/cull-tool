@@ -78,6 +78,11 @@ MUSIQ_DATA_URL = ("https://huggingface.co/86Cao/IQA-ONNX-Models/resolve/main/"
                   "musiq_model.onnx.data")
 NIMA_URL = ("https://huggingface.co/cromsc/nima-mobilenet-aesthetic/resolve/main/"
             "nima_mobilenet_aesthetic.onnx")
+AES_V25_NAME = "aesthetic_predictor_v2_5.onnx"
+# SigLIP so400m 版本的 v2.5, 约 1.7GB。精度明显高于 NIMA, 但每张要几百毫秒到几秒, 且每个
+# 进程各自建 session 要多占约 2GB 内存 —— 所以默认不用, 由 aesthetic_model 配置显式选。
+AES_V25_URL = ("https://huggingface.co/fsw/aesthetic-predictor-v2-5_onnx/resolve/main/"
+               + AES_V25_NAME)
 
 # name -> [(文件名, url, 最小字节)]。musiq 用外部数据格式(.onnx + .onnx.data), 两个都要下。
 ASSETS = {
@@ -86,13 +91,19 @@ ASSETS = {
     "musiq": [("musiq_model.onnx", MUSIQ_ONNX_URL, 500_000),
               ("musiq_model.onnx.data", MUSIQ_DATA_URL, 50_000_000)],
     "nima": [("nima_mobilenet_aesthetic.onnx", NIMA_URL, 10_000_000)],
+    "aes_v25": [(AES_V25_NAME, AES_V25_URL, 1_600_000_000)],
 }
+
+# 可选的美感模型。两者的输出都落在 1~10, 所以 _score_parts() 的归一化不用分模型。
+AESTHETIC_MODELS = ("nima", "aes_v25")
 
 # 默认配置 (可被 cull_config.json 覆盖)
 DEFAULT_CFG = {
     "model_dir": None,                       # 覆盖模型存放目录
     "enable": {"landmark": True, "musiq": True, "nima": True},
     "weights": {"sharp": 0.30, "tech": 0.20, "pose": 0.20, "expr": 0.15, "aes": 0.15},
+    # 美感模型: "nima" (10MB, 38ms/张, 默认) 或 "aes_v25" (1.7GB, 慢得多但更准)。
+    "aesthetic_model": "nima",
 }
 _CFG = json.loads(json.dumps(DEFAULT_CFG))   # 深拷贝
 
@@ -151,12 +162,21 @@ def ensure_asset(key):
         dst = os.path.join(d, fname)
         if not os.path.isfile(dst) or os.path.getsize(dst) < min_size:
             print(f"首次运行: 下载模型 {fname} ...")
+            # 先下到进程私有的临时名再改名。多个 worker 会同时发现"模型不在"并各自下载,
+            # 写同一个目标文件会互相覆盖 —— 实测 musiQ 的 .onnx.data 就这样被写坏过。
+            tmp = f"{dst}.{os.getpid()}.part"
             try:
-                urllib.request.urlretrieve(url, dst)
+                urllib.request.urlretrieve(url, tmp)
+                os.replace(tmp, dst)
             except Exception as exc:                         # noqa: BLE001
+                for p in (tmp, dst):
+                    try:
+                        os.remove(p)                 # 清掉半个文件, 免得下次当它是好的
+                    except OSError:
+                        pass
                 raise RuntimeError(
                     f"模型下载失败 ({fname}): {exc}\n"
-                    f"可手动下载后放到 {os.path.join(d, fname)}, "
+                    f"可手动下载后放到 {dst}, "
                     f"或用 cull_config.json 的 model_dir 指定目录") from exc
         if first is None:
             first = dst
@@ -266,8 +286,27 @@ def tech_quality(bgr, sess):
     return float(np.asarray(out).ravel()[0])
 
 
-def aesthetic_score(bgr, sess):
-    """NIMA 美感 (1~10): 输出 10 个 bin 的概率, 取期望值。"""
+def aesthetic_model_name():
+    """当前配置的美感模型名。只在 cull_config.json 里改, 不在界面上暴露。"""
+    m = str(_CFG.get("aesthetic_model") or "nima").strip().lower()
+    return m if m in AESTHETIC_MODELS else "nima"
+
+
+def aesthetic_score(bgr, sess, model="nima"):
+    """美感分 (约 1~10)。按模型分派前处理与输出解析 —— 两个模型输出都是 1~10, 可直接比。
+
+    模型名由调用方显式传入 (_W["aes_model"])。不能在这里读 _CFG: 多进程用 spawn 起子进程,
+    子进程重新 import cull 时 load_config() 会把 _CFG 重置回默认值, 父进程的 CLI 覆盖
+    根本传不过去 —— 实测那样会静默用 nima 算分, 却以为用的是 aes_v25。
+    """
+    if model == "aes_v25":
+        # SigLIP: 384x384, 双三次缩放后 (x-0.5)/0.5。模型直接回归出一个分数。
+        x = cv2.resize(bgr, (384, 384), interpolation=cv2.INTER_CUBIC)
+        x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        x = ((x - 0.5) / 0.5).transpose(2, 0, 1)[np.newaxis]
+        out = sess.run(["output"], {"input": x.astype(np.float32)})[0]
+        return float(np.asarray(out).ravel()[0])
+    # NIMA: 224x224, 输出 10 个 bin 的概率, 取期望值。
     x = cv2.resize(bgr, (224, 224), interpolation=cv2.INTER_AREA)
     x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     out = sess.run(None, {sess.get_inputs()[0].name: x[np.newaxis].astype(np.float32)})[0][0]
@@ -595,7 +634,8 @@ class HardStopPool:
         return False
 
 
-def worker_init(model_path, full, preview_dir=None, preview_side=2048, cv_threads=1):
+def worker_init(model_path, full, preview_dir=None, preview_side=2048, cv_threads=1,
+                aesthetic_model=None):
     # 多进程时要把 OpenCV 自己的线程数压下来: 默认它会开满所有核,
     # 4 个进程 x 20 线程 = 80 线程抢 20 个核, 反而把整体拖慢。
     if cv_threads and cv_threads > 0:
@@ -606,14 +646,21 @@ def worker_init(model_path, full, preview_dir=None, preview_side=2048, cv_thread
     _W["preview_dir"] = preview_dir
     _W["preview_side"] = preview_side
     # 关键点 / 画质 / 美感 三组 onnx 会话。缺模型不影响锐度主流程, 只是该项跳过。
+    # 美感模型由调用方传进来 (不能读 _CFG: spawn 出的子进程读不到父进程的覆盖)。
+    aes_key = aesthetic_model or aesthetic_model_name()
+    _W["aes_model"] = aes_key
     en = _CFG.get("enable", {})
-    for key, sk in (("landmark", "lmk"), ("musiq", "musiq"), ("nima", "nima")):
+    for key, sk, cfg in (("landmark", "lmk", "landmark"),
+                         ("musiq", "musiq", "musiq"),
+                         (aes_key, "nima", "nima")):
         _W[sk] = None
-        if en.get(key, True):
-            try:
-                _W[sk] = make_ort_session(ensure_asset(key))
-            except Exception as exc:                         # noqa: BLE001
-                print(f"  [!] {key} 模型不可用, 该项跳过 ({exc})")
+        if not en.get(cfg, True):
+            continue
+        try:
+            _W[sk] = make_ort_session(ensure_asset(key))
+        except Exception as exc:                             # noqa: BLE001
+            what = f"美感模型 {key}" if sk == "nima" else f"{key} 模型"
+            print(f"  [!] {what}不可用, 该项跳过 ({exc})")
 
 
 def process_one(name, folder):
@@ -924,7 +971,7 @@ def analyze(path, detector, full=False, af_point=None, preview_path=None, previe
             pass
     if _W.get("nima") is not None:
         try:
-            rec["aes"] = round(aesthetic_score(bgr, _W["nima"]), 2)
+            rec["aes"] = round(aesthetic_score(bgr, _W["nima"], _W.get("aes_model")), 2)
         except Exception:                                   # noqa: BLE001
             pass
 
@@ -1710,11 +1757,12 @@ def write_csv(rows, path):
 # 存的必须是**原始测量值**, 不存 group/soft/best_in_group —— 那几个由
 # compute_flags() 纯计算得出, 存了反而会和 --group-ncc/--ratio 参数打架。
 # ==========================================================================
-CACHE_VERSION = 4          # 改测量逻辑就 +1, 旧缓存自动作废
+CACHE_VERSION = 5          # 改测量逻辑就 +1, 旧缓存自动作废
                             # v2: 选脸规则从"最大面积"改成"最清楚那张", sig 含义跟着变了
                             # v3: 眼部锐度改成对比度归一化 (除以眼部区域 std), 抵消阴影/欠曝
                             # v4: 眼部锐度再按瞳距做尺度归一化 + 按 yaw 做朝向归一化;
                             #     新增 yaw/pitch/roll/ear/mos_tech/aes 与修图价值分
+                            # v5: 美感模型可切换 (nima/aes_v25), 缓存记下用的是哪个
 # 缓存就落在**照片文件夹里** (不再写 C 盘), 文件名固定。
 # 用固定名而不是"路径的 sha1": 缓存跟照片放一起, 文件夹整体拷贝/挪动后缓存也跟着走 ——
 # 但读回时校验 data["folder"] 必须等于当前文件夹, 所以换了路径会作废重扫, 不会串味。
@@ -1802,6 +1850,7 @@ def write_cache(folder, rows, full, groups_ncc=0.85, soft_ratio=0.55):
         data = {"version": CACHE_VERSION, "folder": os.path.abspath(folder),
                 "full": bool(full), "groups_ncc": groups_ncc,
                 "soft_ratio": soft_ratio, "n": len(items),
+                "aesthetic_model": aesthetic_model_name(),
                 "ts": int(time.time()), "items": items}
         # 先写临时文件再改名, 免得中途被杀写出半个坏文件
         dst = cache_path(folder)
@@ -1821,6 +1870,7 @@ def read_cache(folder, full, names=None):
     校验项 (任一不满足就当没有缓存):
       - 文件在、能解析、version 对得上
       - full 标志一致 (半分辨率和全分辨率的分数没有可比性)
+      - 美感模型一致 (换了模型 aes 就不可比; 旧缓存没这个字段也作废)
       - 目录里的照片集合和缓存记录的完全一致 (新增/删了照片)
       - 每张照片现在的大小+修改时间和记录一致 (被改过)
     """
@@ -1835,6 +1885,9 @@ def read_cache(folder, full, names=None):
     if data.get("version") != CACHE_VERSION or data.get("folder") != os.path.abspath(folder):
         return None
     if bool(data.get("full")) != bool(full):
+        return None
+    # 换了美感模型, 缓存里的 aes 就是另一个模型算的, 不能混用
+    if data.get("aesthetic_model") != aesthetic_model_name():
         return None
 
     items = data.get("items") or []
@@ -2032,6 +2085,8 @@ def main():
                          "不同时段的照片并进来, 也越容易出现跨时段的大组)")
     ap.add_argument("--full", action="store_true", help="全分辨率解码 (更准, 慢约 5 倍)")
     ap.add_argument("--model", default=None, help="YuNet 模型路径")
+    ap.add_argument("--aesthetic-model", default=None, choices=list(AESTHETIC_MODELS),
+                    help="美感模型: nima (默认, 快) 或 aes_v25 (1.7GB, 慢但更准)")
     ap.add_argument("--jobs", type=int, default=4,
                     help="并行进程数 (默认 4; 实测解码受内存带宽限制, 4 个最快, 加到 8/16 反而更慢)")
     ap.add_argument("--sheet", action="store_true", help="额外导出检测结果总览图 (核对检测是否准确)")
@@ -2051,6 +2106,13 @@ def main():
     ap.add_argument("--open", action="store_true", help="跑完自动用浏览器打开选图报告")
     ap.add_argument("--pause", action="store_true", help="跑完等按任意键 (双击/拖放启动时用)")
     args = ap.parse_args()
+
+    # CLI 覆盖美感模型。注意: spawn 出的子进程会重新 import cull 并 load_config(),
+    # 把 _CFG 重置回默认值, 所以光改 _CFG 传不到 worker —— 还必须经 worker_init 的
+    # aesthetic_model 参数显式传下去 (见下面 initargs)。
+    if args.aesthetic_model:
+        _CFG["aesthetic_model"] = args.aesthetic_model
+    aes_model = aesthetic_model_name()
 
     target = args.folder
     if target is None:
@@ -2100,7 +2162,7 @@ def main():
     print(f"待分析 {len(names)} 个文件"
           + (f" (跳过 {n_all - len(names)} 个已有 RAW 的 jpg 导出版)" if n_all > len(names) else ""))
     print(f"解码: {'全分辨率' if args.full else '半分辨率 (--full 更准)'}   "
-          f"进程: {jobs}   阈值: 组内最佳 x {args.ratio}"
+          f"进程: {jobs}   阈值: 组内最佳 x {args.ratio}   美感: {aes_model}"
           + (f"   大图预览: {args.preview_size}px" if preview_dir else "   大图预览: 关") + "\n")
 
     rows = []
@@ -2108,7 +2170,7 @@ def main():
     if jobs > 1 and len(names) > 1:
         with HardStopPool(max_workers=jobs, initializer=worker_init,
                           initargs=(model_path, args.full, preview_dir,
-                                    args.preview_size, cv_threads)) as ex:
+                                    args.preview_size, cv_threads, aes_model)) as ex:
             futs = [ex.submit(process_one, n, folder) for n in names]
             try:
                 for i, f in enumerate(as_completed(futs), 1):
@@ -2121,7 +2183,8 @@ def main():
                 ex.stop()
                 raise
     else:
-        worker_init(model_path, args.full, preview_dir, args.preview_size, cv_threads)
+        worker_init(model_path, args.full, preview_dir, args.preview_size, cv_threads,
+                    aes_model)
         for i, n in enumerate(names, 1):
             rec = process_one(n, folder)
             rows.append(rec)

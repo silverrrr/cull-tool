@@ -239,12 +239,14 @@ class Api:
         model = self._model_path()
         # 注意: 不建 out_dir, 也不传 preview_dir —— 除结果缓存外一个文件都不写
         self._last_full = bool(full)
-        cull.worker_init(model, full, None, 0, 1 if jobs > 1 else 0)
+        # worker 是 spawn 出来的, 读不到本进程对 _CFG 的改动, 美感模型必须显式传
+        aes_model = cull.aesthetic_model_name()
+        cull.worker_init(model, full, None, 0, 1 if jobs > 1 else 0, aes_model)
         rows = []
         if jobs > 1 and len(names) > 1:
             from concurrent.futures import as_completed
             ex = cull.HardStopPool(max_workers=jobs, initializer=cull.worker_init,
-                                  initargs=(model, full, None, 0, 1))
+                                   initargs=(model, full, None, 0, 1, aes_model))
             with self._pool_lock:
                 self._pool = ex
             try:
@@ -489,7 +491,8 @@ class Api:
         if row is None:
             return {"ok": False, "error": "这张照片不在当前结果里"}
         try:
-            cull.worker_init(self._model_path(), self._last_full, None, 0, 0)
+            cull.worker_init(self._model_path(), self._last_full, None, 0, 0,
+                             cull.aesthetic_model_name())
             cull.reselect_subject(row, name, folder, int(idx),
                                   full=self._last_full, af_point=None)
         except ValueError as exc:

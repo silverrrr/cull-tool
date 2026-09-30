@@ -15,7 +15,7 @@
 - 全离线运行，只读原片，**不会**修改原图（唯一的写操作是用户显式点"移动/复制"）
 - 有两个入口：**GUI 客户端**（单窗口 WebView2）和**命令行**（`cull.py` / `run.bat`）
 - GUI 跑完只写**一个缓存文件**：照片目录里的 `_cull_cache.json`（见 §7），不动原图、不生成别的文件
-- 除了"眼部锐度"，还算了 **修图价值分**：锐度 / 技术画质(MUSIQ) / 姿势(yaw) / 神态(睁眼) / 美感(NIMA)
+- 除了"眼部锐度"，还算了 **修图价值分**：锐度 / 技术画质(MUSIQ) / 姿势(yaw) / 神态(睁眼) / 美感(nima 或 aes_v25)
   五项加权（见 §9）。姿势/神态来自人脸关键点模型（2d106det），画质/美感走 onnxruntime
 - 模型首次运行自动下到 **exe 同级的 `_internal\models\`**（`sys._MEIPASS/models`；源码运行=工具目录\models）
 
@@ -61,8 +61,12 @@ venv\Scripts\python.exe -m pip install --upgrade pip
 
 ```powershell
 venv\Scripts\python.exe -m pip install numpy pillow opencv-python-headless rawpy
-venv\Scripts\python.exe -m pip install pywebview pythonnet pyinstaller
+venv\Scripts\python.exe -m pip install onnxruntime pywebview pythonnet pyinstaller
 ```
+
+> **`onnxruntime` 不能漏**。关键点(2d106det)、MUSIQ 技术画质、美感三项全靠它。
+> 缺了不会报错 —— `worker_init` 里 `make_ort_session` 抛异常, 只打一行
+> `[!] xxx 模型不可用, 该项跳过` 就静默跳过, 界面照样出结果, 只是那几项是空的。
 
 **实测通过的版本**（`pip freeze` 摘出来的，别的组合没验证过）：
 
@@ -72,6 +76,7 @@ numpy                    2.5.3
 Pillow                   12.3.0
 opencv-python-headless   4.14.0.94
 rawpy                    0.27.1
+onnxruntime              1.30.0
 pywebview                6.2.1
 pythonnet                3.1.0
 clr-loader               0.3.1   (pythonnet 带的)
@@ -137,6 +142,7 @@ folder                 照片目录; 不给则进入交互式(可拖文件夹进
 --preview-size 2048    大图预览最长边; 0 = 不生成
 --sheet                额外导出检测总览图 (核对人脸检测准不准)
 --model PATH           指定 YuNet 模型路径 (默认自动下载)
+--aesthetic-model M    美感模型: nima (默认, 10MB/38ms) 或 aes_v25 (1.7GB, 慢但更准)
 
 # 挑片并移动
 --keep-to DIR          把挑中的移到该目录
@@ -700,6 +706,28 @@ B 图的第 1 张脸比，主体就漂了。
 - 只有**同一组内**比较才可靠。这也是"疑似模糊"只在组内判定的原因。
 - 有误报漏报，**最终以肉眼复核为准**。
 - 眨眼/表情/姿态不判断（那需要 Aftershoot / Imagen 这类商业模型的活）。
+
+### 美感模型可切换（`aesthetic_model`）
+
+修图价值分的"美感"一项有两个可选模型，由 `cull_config.json` 的 `aesthetic_model`
+或命令行 `--aesthetic-model` 决定，**默认 `nima`**：
+
+| 名字 | 模型 | 体积 | 单张耗时(CPU) | 说明 |
+|---|---|---|---|---|
+| `nima` | NIMA (MobileNet) | 10MB | ~38ms | 默认，快；分数区间很窄（实测 60 张落在 3.4~4.8） |
+| `aes_v25` | Aesthetic Predictor V2.5 (SigLIP so400m) | 1.7GB | 单线程 7.7s / 4 线程 2.8s | 更准；每个进程多占约 2GB 内存 |
+
+- **两者输出都是 1~10**，所以 `_score_parts()` 的 `(aes-1)/9` 不用分模型。
+  但两个模型的**排序分歧不小**（实测 60 张 Spearman 只有 0.46），别混着比。
+- ⚠ **每个 worker 进程各自建 session**，`aes_v25` 是 **2GB/进程**。4 进程 = 约 8GB 内存，
+  低配机器请同时调小 `--jobs`。
+- 换模型后缓存自动作废（`aesthetic_model` 写进缓存并在 `read_cache` 里校验）。
+- **GPU 加速（DirectML）这条路走不通**：DirectML EP 不支持 `Run()` 并发，且
+  onnxruntime 1.18+ 的 Python 绑定在多线程/多进程建 session 时会崩（官方 issue
+  #20713/#22867），与本项目的多进程模型直接冲突；ROCm 在 Windows 也不支持消费级 Radeon。
+  想省时间就调 `--jobs`，别指望 GPU。
+- 换机器 / 换模型前先在**目标机器**上实测：`venv\Scripts\python.exe bench_aesthetic.py "照片目录" --models nima aes_v25 --threads 1 4 8`
+  （会打印每张耗时、进程内存增量、分数分布；`aes_v25` 不在本地时会自动下载）。
 
 ---
 
