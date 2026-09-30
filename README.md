@@ -106,7 +106,9 @@ JC_05478.ARW            ->  精选\JC_05478.ARW
 > `model` / `max_images` / `timeout`。
 
 > **它只给建议, 不动你的照片, 也不写任何文件**。结果只在窗口里显示, 关掉就没了。
-> 连不上 Ollama 只会提示一条错误, 不影响选片。
+> 没开 Ollama 时界面**不会一直弹错** —— 平时只是把模型下拉标成「连不上 Ollama」,
+> 只有你主动点「刷新模型」/「保存地址」/「拉取」/「AI 调色建议」时才明确报一条,
+> 选片主流程完全不受影响。
 >
 > 小模型看得懂"这组偏暖、发灰", 但**直接看图报数值不准** —— 所以面板里的数字是程序
 > 对照片实测 (直方图/白平衡/曝光等) 算出来的, 模型只负责审美判断和把数字讲成人话。
@@ -320,14 +322,90 @@ Flexible Spot 拍摄才能拿到数据。** 用 Wide 拍的话, 这条路是堵�
 
 ## 换机器 / 重装
 
-工具是自带虚拟环境 (`venv\`) 的, 整目录拷走即可。
-如果 venv 失效了, 重建:
+分两种情况: **只用打包好的客户端**(目标机器不需要 Python) 和 **要改代码 / 重新打包**。
+
+### A. 只用客户端
+
+打包后的 `..\_cull_dist\选图工具\` **自带整个运行环境**, 把这一整个目录拷过去就行。
+目标机器上**不用装 Python**, 只要满足两条:
+
+| 要求 | 说明 |
+|---|---|
+| Windows 10 / 11 | 代码里用了 `os.startfile` / `explorer /select,` / `msvcrt`, 不能跨平台 |
+| WebView2 运行时 | **Win11 自带; Win10 大概率要单独装** |
+
+WebView2 下载: <https://developer.microsoft.com/microsoft-edge/webview2/>
+
+- 没装 WebView2 的表现: 双击 exe **弹窗报错然后退出**, 不会静默退回已废弃的 IE 内核
+  (`app.py` 的 `main()` 里有显式检查)。命令行 `run.bat` 不受影响, 照常可用。
+- **必须拷整个文件夹**。依赖全在 `_internal\` 里, 只拷 exe 会报
+  `Failed to load Python DLL ... _internal\python312.dll`。
+- 模型会在首次点「开始分析」时自动下载 (检测器 230KB / 关键点 5MB / 画质 108MB,
+  选 `aes_v25` 另有 1.7GB), 界面顶部有进度条。**离线机器**就提前把模型放到
+  `_internal\models\` (文件名见 `cull.py` 里的 `ASSETS`)。
+
+### B. 要改代码 / 重新打包 (需要 Python)
+
+从零开始的完整步骤。`cull-tool` 是源码目录, 打包产物在它外面的 `_cull_dist\`:
+
+```powershell
+git clone https://github.com/silverrrr/cull-tool.git
+cd cull-tool
+
+python -m venv venv
+venv\Scripts\python.exe -m pip install --upgrade pip
+
+# onnxruntime 不能漏 —— 关键点 / 技术画质 / 美感三项全靠它。缺了不报错, 只静默跳过。
+venv\Scripts\python.exe -m pip install numpy pillow opencv-python-headless rawpy
+venv\Scripts\python.exe -m pip install onnxruntime pywebview pythonnet pyinstaller
+```
+
+自检 (第二条**必须**输出 `edgechromium`; 输出 `mshtml` = 没装 WebView2, GUI 跑不起来):
+
+```powershell
+venv\Scripts\python.exe -c "import cull, app; print('OK')"
+venv\Scripts\python.exe -c "import webview.platforms.winforms as w; print(w.renderer)"
+```
+
+跑起来 / 打包:
+
+```powershell
+venv\Scripts\python.exe app.py                          # GUI (改完 ui.html / *.py 重启即可, 不用重新打包)
+venv\Scripts\python.exe cull.py "D:\照片\xxx" --open     # 命令行版
+venv\Scripts\python.exe build.py                        # 重新打包 -> ..\_cull_dist\选图工具\
+```
+
+实测通过的版本 (别的组合没验证过):
 
 ```
-python -m venv venv
-venv\Scripts\python.exe -m pip install numpy pillow opencv-python-headless "rawpy" \
-    pywebview pythonnet pyinstaller
+Python 3.12.10 · numpy 2.5.3 · Pillow 12.3.0 · opencv-python-headless 4.14.0.94
+rawpy 0.27.1 · onnxruntime 1.30.0 · pywebview 6.2.1 · pythonnet 3.1.0 · pyinstaller 6.22.3
 ```
+
+> `opencv-python-headless` 必须是 **4.x** —— 5.x 移除了 Haar 级联、headless 包也不带级联
+> xml (本项目用 YuNet, 不受影响, 但看到 `haarcascades` 之类的报错先查这个版本)。
+> 另外别装 `opencv-python` (带 GUI 的那个), 打包体积会大很多。
+
+#### venv 坏了 / 换了台机器要重建
+
+**`venv\` 不能直接拷到别的机器** —— 里面的 `python.exe` 是硬编码绝对路径的, 拷过去起不来。
+重建就是删掉重来 (别试图"修"它):
+
+```powershell
+Remove-Item -Recurse -Force venv
+python -m venv venv
+venv\Scripts\python.exe -m pip install --upgrade pip
+venv\Scripts\python.exe -m pip install numpy pillow opencv-python-headless rawpy
+venv\Scripts\python.exe -m pip install onnxruntime pywebview pythonnet pyinstaller
+```
+
+三个坑:
+
+- 装包一定走 **`venv\Scripts\python.exe -m pip`**, 不要直接敲 `pip` / `python`
+  (那会装进系统的 Python, venv 里照样缺)
+- 重装完先跑一遍上面那两条自检命令再干活
+- **打包产物跟 venv 无关**: `build.py` 把依赖和模型都收进了 `_internal\`, 拷到别的电脑
+  不需要任何 Python 环境。所以"重装"只影响你改代码这一台机器。
 
 ## 已知环境问题
 

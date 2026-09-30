@@ -154,8 +154,36 @@ def _ascii_dir():
     return None
 
 
-def ensure_asset(key):
-    """按需下载某组模型文件, 返回主模型路径。失败抛 RuntimeError。"""
+def _download(url, dst, fname, on_progress=None):
+    """带进度的下载 (取代 urlretrieve)。
+
+    on_progress(已下字节, 总字节, 文件名)。远端不给 Content-Length 时总字节为 0,
+    调用方据此显示"已下载 X MB"而不是百分比。每读完一块就回调, 是否节流交给调用方。
+    """
+    with urllib.request.urlopen(url) as r, open(dst, "wb") as fh:
+        try:
+            total = int(r.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        done = 0
+        if on_progress:
+            on_progress(0, total, fname)
+        while True:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            fh.write(chunk)
+            done += len(chunk)
+            if on_progress:
+                on_progress(done, total, fname)
+
+
+def ensure_asset(key, on_progress=None):
+    """按需下载某组模型文件, 返回主模型路径。失败抛 RuntimeError。
+
+    on_progress 会透传给 _download: 首次运行下大模型 (musiq 的 .data 108MB、aes_v25
+    1.7GB) 时, 界面靠它显示进度条, 不然会以为程序卡死了。文件已在则一次都不回调。
+    """
     d = model_dir()
     first = None
     for fname, url, min_size in ASSETS[key]:
@@ -166,7 +194,7 @@ def ensure_asset(key):
             # 写同一个目标文件会互相覆盖 —— 实测 musiQ 的 .onnx.data 就这样被写坏过。
             tmp = f"{dst}.{os.getpid()}.part"
             try:
-                urllib.request.urlretrieve(url, tmp)
+                _download(url, tmp, fname, on_progress)
                 os.replace(tmp, dst)
             except Exception as exc:                         # noqa: BLE001
                 for p in (tmp, dst):
@@ -202,11 +230,11 @@ def _opencv_loadable(path):
     return mirror
 
 
-def ensure_model(path=None):
+def ensure_model(path=None, on_progress=None):
     """YuNet 检测模型。--model 指定就用它, 否则按需下载到 model_dir。"""
     if path and os.path.isfile(path):
         return _opencv_loadable(path)
-    return _opencv_loadable(ensure_asset("yunet"))
+    return _opencv_loadable(ensure_asset("yunet", on_progress))
 
 
 def make_detector(model_path, score_thr=0.6):
@@ -287,9 +315,51 @@ def tech_quality(bgr, sess):
 
 
 def aesthetic_model_name():
-    """当前配置的美感模型名。只在 cull_config.json 里改, 不在界面上暴露。"""
+    """当前配置的美感模型名。由 GUI 下拉 (save_aesthetic_model)、CLI --aesthetic-model
+    或 cull_config.json 的顶层 aesthetic_model 设置。"""
     m = str(_CFG.get("aesthetic_model") or "nima").strip().lower()
     return m if m in AESTHETIC_MODELS else "nima"
+
+
+def save_aesthetic_model(name):
+    """把美感模型写进 cull_config.json 的顶层 aesthetic_model, 并立刻更新 _CFG。
+
+    只覆盖 aesthetic_model 这一个键, weights / model_dir / ollama 等其它顶层键原样保留
+    (所以不能整份配置文件重写)。写入位置与 load_config 的读取顺序一致: 优先写已存在的
+    那份, 都没有则源码写工具目录、打包写 exe 同级 —— 绝不写进 sys._MEIPASS 临时目录。
+    返回 {"ok": True, "model": <生效名>, "path": <写入路径>} 或 {"ok": False, "error": <中文>}。
+    """
+    m = str(name or "").strip().lower()
+    if m not in AESTHETIC_MODELS:
+        return {"ok": False,
+                "error": f"不支持的模型: {name!r} (可选: {', '.join(AESTHETIC_MODELS)})"}
+
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    candidates = (os.path.join(base, os.pardir, "cull_config.json"),
+                  os.path.join(base, "cull_config.json"))
+    path = next((c for c in candidates if os.path.isfile(c)), None)
+    if path is None:
+        path = (os.path.join(os.path.dirname(sys.executable), "cull_config.json")
+                if getattr(sys, "frozen", False) else os.path.join(base, "cull_config.json"))
+
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            got = json.load(fh)
+        if isinstance(got, dict):                           # 读回其它顶层键
+            data = got
+    except Exception:                                       # noqa: BLE001  损坏/缺失都用空 dict
+        data = {}
+    data["aesthetic_model"] = m
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        return {"ok": False, "error": f"写入配置失败: {exc}"}
+
+    _CFG["aesthetic_model"] = m          # 本进程立即生效 (analyze/reselect 都读 _CFG)
+    return {"ok": True, "model": m, "path": path}
 
 
 def aesthetic_score(bgr, sess, model="nima"):
@@ -635,7 +705,7 @@ class HardStopPool:
 
 
 def worker_init(model_path, full, preview_dir=None, preview_side=2048, cv_threads=1,
-                aesthetic_model=None):
+                aesthetic_model=None, on_progress=None):
     # 多进程时要把 OpenCV 自己的线程数压下来: 默认它会开满所有核,
     # 4 个进程 x 20 线程 = 80 线程抢 20 个核, 反而把整体拖慢。
     if cv_threads and cv_threads > 0:
@@ -657,7 +727,7 @@ def worker_init(model_path, full, preview_dir=None, preview_side=2048, cv_thread
         if not en.get(cfg, True):
             continue
         try:
-            _W[sk] = make_ort_session(ensure_asset(key))
+            _W[sk] = make_ort_session(ensure_asset(key, on_progress))
         except Exception as exc:                             # noqa: BLE001
             what = f"美感模型 {key}" if sk == "nima" else f"{key} 模型"
             print(f"  [!] {what}不可用, 该项跳过 ({exc})")
@@ -873,7 +943,19 @@ def reselect_subject(row, name, folder, idx, full=False, af_point=None):
     fx, fy, fw, fh = [float(v) * inv for v in f[:4]]
     lms = (f[4:14].reshape(5, 2) * inv)
     conf = float(f[-1])
-    eye, eboxes = measure_face(gray, fx, fy, fw, fh, lms)
+    # 姿态(yaw) / 神态(ear) 也要按**选中的这张脸**重算, 否则"修图价值"里这两维
+    # 还是自动选中那张脸的值 (compute_flags 是从 row 的 yaw/ear 现算子分数的)。
+    # 和 pick_subject 同一口径: 检出关键点 -> eye_metrics。模型缺失/检测失败就留 None。
+    yaw = ear = None
+    lmk = _W.get("lmk")
+    if lmk is not None:
+        try:
+            ear, yaw = eye_metrics(detect_landmarks(bgr, (fx, fy, fw, fh), lmk), lms)
+        except Exception:                                # noqa: BLE001
+            yaw = ear = None
+    # yaw 必须传给 measure_face: 侧脸时它按 1/cos(yaw) 横向多取样。不传就跟
+    # analyze() 算出来的眼部锐度不是一个口径 (3/4 侧脸会偏低)。
+    eye, eboxes = measure_face(gray, fx, fy, fw, fh, lms, yaw or 0.0)
     face_ten, _ = patch_sharpness(gray, fx + fw / 2, fy + fh / 2, max(fw, fh) * 0.55)
     row.update({
         "eye_sharp": round(eye, 1),
@@ -886,6 +968,8 @@ def reselect_subject(row, name, folder, idx, full=False, af_point=None):
         "sig": face_signature(gray, (fx, fy, fw, fh)),
         "_face_box": [int(fx), int(fy), int(fw), int(fh)],
         "_eye_boxes": eboxes,
+        "yaw": round(yaw, 1) if yaw is not None else None,
+        "ear": round(ear, 3) if ear is not None else None,
         "subject_idx": idx,
         "compare_value": round(eye, 1),
     })
@@ -1757,12 +1841,13 @@ def write_csv(rows, path):
 # 存的必须是**原始测量值**, 不存 group/soft/best_in_group —— 那几个由
 # compute_flags() 纯计算得出, 存了反而会和 --group-ncc/--ratio 参数打架。
 # ==========================================================================
-CACHE_VERSION = 5          # 改测量逻辑就 +1, 旧缓存自动作废
+CACHE_VERSION = 6          # 改测量逻辑就 +1, 旧缓存自动作废
                             # v2: 选脸规则从"最大面积"改成"最清楚那张", sig 含义跟着变了
                             # v3: 眼部锐度改成对比度归一化 (除以眼部区域 std), 抵消阴影/欠曝
                             # v4: 眼部锐度再按瞳距做尺度归一化 + 按 yaw 做朝向归一化;
                             #     新增 yaw/pitch/roll/ear/mos_tech/aes 与修图价值分
                             # v5: 美感模型可切换 (nima/aes_v25), 缓存记下用的是哪个
+                            # v6: aes 改成按模型存的字典 {模型: 分数}, 换模型不再整份作废
 # 缓存就落在**照片文件夹里** (不再写 C 盘), 文件名固定。
 # 用固定名而不是"路径的 sha1": 缓存跟照片放一起, 文件夹整体拷贝/挪动后缓存也跟着走 ——
 # 但读回时校验 data["folder"] 必须等于当前文件夹, 所以换了路径会作废重扫, 不会串味。
@@ -1825,9 +1910,44 @@ def _dec_sig(b64):
         return None
 
 
-def write_cache(folder, rows, full, groups_ncc=0.85, soft_ratio=0.55):
-    """把一轮分析结果落盘。失败不致命 —— 顶多下次重扫, 所以别向上抛。"""
+def _prev_aes(folder, full):
+    """读旧缓存里每条已存的 aes 字典 {模型: 分数}, 给 write_cache 合并新模型时保留旧的。
+
+    只有整份缓存仍对得上才用: version / folder / full 一致; 且**逐张**当前大小+修改时间
+    和记录一致才采用该张的旧 aes (照片被改过就不复用它的旧分)。对不上的一律跳过。
+    """
     try:
+        with open(cache_path(folder), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:                                       # noqa: BLE001
+        return {}
+    if (data.get("version") != CACHE_VERSION
+            or data.get("folder") != os.path.abspath(folder)
+            or bool(data.get("full")) != bool(full)):
+        return {}
+    out = {}
+    for it in data.get("items") or []:
+        aes = it.get("aes")
+        if not isinstance(aes, dict) or not aes:
+            continue
+        try:
+            st = os.stat(os.path.join(folder, it.get("f") or ""))
+        except OSError:
+            continue
+        if st.st_size != it.get("sz") or int(st.st_mtime) != it.get("mt"):
+            continue                                        # 照片改过, 旧分作废
+        out[it.get("f")] = aes
+    return out
+
+
+def write_cache(folder, rows, full, groups_ncc=0.85, soft_ratio=0.55):
+    """把一轮分析结果落盘。失败不致命 —— 顶多下次重扫, 所以别向上抛。
+
+    aes 按模型累加 (CACHE_VERSION v6): 先读回旧缓存里已存的其它模型分数合并进来,
+    这样换美感模型重新分析时, 之前用另一个模型算的那一维不会被丢掉。
+    """
+    try:
+        prev = _prev_aes(folder, full)
         items = []
         for r in rows:
             try:
@@ -1840,7 +1960,13 @@ def write_cache(folder, rows, full, groups_ncc=0.85, soft_ratio=0.55):
             it = {"f": r["file"], "sz": st.st_size, "mt": int(st.st_mtime),
                   "sig": _enc_sig(r.get("sig")), "thumb": thumb}
             for k in _CACHE_FIELDS:
+                if k == "aes":
+                    continue            # aes 不走这里, 单独按模型存成字典
                 it[k] = _py(v) if (v := r.get(k)) is not None else None
+            aes_map = dict(prev.get(r["file"], {}))
+            if r.get("aes") is not None:
+                aes_map[aesthetic_model_name()] = _py(r["aes"])
+            it["aes"] = aes_map or None
             for k in _CACHE_RATIOS:
                 v = r.get(k)
                 it[k] = list(v) if v else None
@@ -1850,6 +1976,7 @@ def write_cache(folder, rows, full, groups_ncc=0.85, soft_ratio=0.55):
         data = {"version": CACHE_VERSION, "folder": os.path.abspath(folder),
                 "full": bool(full), "groups_ncc": groups_ncc,
                 "soft_ratio": soft_ratio, "n": len(items),
+                # 仅记录"最近一次写盘用的模型", 不再参与校验 (aes 已按模型逐条存)
                 "aesthetic_model": aesthetic_model_name(),
                 "ts": int(time.time()), "items": items}
         # 先写临时文件再改名, 免得中途被杀写出半个坏文件
@@ -1870,7 +1997,7 @@ def read_cache(folder, full, names=None):
     校验项 (任一不满足就当没有缓存):
       - 文件在、能解析、version 对得上
       - full 标志一致 (半分辨率和全分辨率的分数没有可比性)
-      - 美感模型一致 (换了模型 aes 就不可比; 旧缓存没这个字段也作废)
+      - 每张都有**当前美感模型**的 aes (aes 按模型存成字典; 缺当前模型的整份不能混用)
       - 目录里的照片集合和缓存记录的完全一致 (新增/删了照片)
       - 每张照片现在的大小+修改时间和记录一致 (被改过)
     """
@@ -1886,10 +2013,8 @@ def read_cache(folder, full, names=None):
         return None
     if bool(data.get("full")) != bool(full):
         return None
-    # 换了美感模型, 缓存里的 aes 就是另一个模型算的, 不能混用
-    if data.get("aesthetic_model") != aesthetic_model_name():
-        return None
 
+    model = aesthetic_model_name()
     items = data.get("items") or []
     # 照片集合变了就作废: 否则新拍的那几张根本不在缓存里, 界面上会少照片
     if names is not None:
@@ -1905,6 +2030,10 @@ def read_cache(folder, full, names=None):
             return None                   # 记录里的文件没了
         if st.st_size != it.get("sz") or int(st.st_mtime) != it.get("mt"):
             return None                   # 照片被改过
+        # 当前模型的 aes 缺了就不能整份混用 (别的模型的分不能当它用)
+        aes_map = it.get("aes")
+        if not isinstance(aes_map, dict) or model not in aes_map:
+            return None
         r = {"file": it["f"], "orig_uri": pathlib.Path(fp).as_uri(),
              "sig": _dec_sig(it.get("sig")), "preview_rel": ""}
         # 下面 _CACHE_FIELDS 循环会把 _face_box/_eye_boxes/_face_boxes 一起带回来
@@ -1913,7 +2042,10 @@ def read_cache(folder, full, names=None):
         thumb = it.get("thumb") or ""
         r["_thumb"] = THUMB_PREFIX + thumb if thumb else ""
         for k in _CACHE_FIELDS:
+            if k == "aes":
+                continue                  # aes 单独取当前模型那一项 (下面填标量)
             r[k] = it.get(k)
+        r["aes"] = aes_map[model]
         for k in _CACHE_RATIOS:
             v = it.get(k)
             r[k] = tuple(v) if v else None

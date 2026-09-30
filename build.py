@@ -61,6 +61,16 @@ def main():
         '--exclude-module', 'IPython',
         '--upx-dir', '',
     ]
+    # 把项目里已下好的模型一并打进 _internal\models。打包后 cull.model_dir() 返回
+    # _MEIPASS\models (= _internal\models), ensure_asset() 发现文件已在就不会再联网下载。
+    # models\ 不进版本库 (见 .gitignore), 全新 clone 上没有 -> 跳过, 装出来仍会在首次
+    # 运行按需下载。注意: 里面可能含 1.7GB 的 aes_v25, 会明显拖慢打包并撑大成品。
+    models_dir = os.path.join(TOOL, 'models')
+    if os.path.isdir(models_dir) and os.listdir(models_dir):
+        args += ['--add-data', f'{models_dir};models']
+        p("bundling models from", models_dir)
+    else:
+        p("no local models/ dir -> exe will download models on first run")
     p("running PyInstaller with", len(args), "args")
     try:
         run(args)

@@ -19,6 +19,12 @@ wv_datas, wv_bins, wv_hidden = collect_all('webview')
 pn_datas, pn_bins, pn_hidden = collect_all('pythonnet')
 
 datas = wv_datas + pn_datas + [(os.path.join(TOOL, 'ui.html'), '.')]
+
+# 项目里已下好的模型一起进 _internal\models: 打包后 cull.model_dir() 指向 _MEIPASS\models,
+# 运行时就不会再联网下载。models\ 不进版本库, 没有就跳过 (这样全新 clone 也能打包)。
+_models = os.path.join(TOOL, 'models')
+if os.path.isdir(_models) and os.listdir(_models):
+    datas += [(_models, 'models')]
 binaries = wv_bins + pn_bins
 hiddenimports = sorted(set(
     ['rawpy', 'PIL._tkinter_finder', 'PIL.Image',

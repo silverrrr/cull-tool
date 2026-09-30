@@ -347,6 +347,9 @@ def save_settings(settings):
         merged["timeout"] = timeout
 
     path = _write_config_path()
+    # 先丢掉缓存重读: cull.save_aesthetic_model() 可能刚改过同一份文件里的
+    # aesthetic_model (GUI 的"美感模型"下拉)。用旧缓存重写会把那个改动抹掉。
+    _invalidate_config()
     raw = _load_raw_config()
     data = dict(raw) if isinstance(raw, dict) else {}
     data["ollama"] = merged

@@ -167,11 +167,32 @@ class Api:
     def _cancelled(self, run_id):
         return self._cancel.is_set() or self._run_id != run_id
 
-    def _model_path(self):
+    def _model_path(self, on_progress=None):
         # 首次运行要联网下 230KB 模型, 所以等到真要点分析时才加载, 别卡住窗口创建
         if self._model is None:
-            self._model = cull.ensure_model(None)
+            self._model = cull.ensure_model(None, on_progress)
         return self._model
+
+    def _dl_progress(self):
+        """模型下载的进度回调: 把 (已下字节, 总字节, 文件名) 节流后推进消息队列。
+
+        不节流的话 1.7GB 的 aes_v25 每 256KB 就推一条, 会有几千条。这里每个文件
+        开头先报一次, 之后每涨约 1% (总大小未知时 512KB) 再报一次。
+        """
+        st = {"name": None, "next": 0}
+
+        def cb(done, total, fname):
+            step = max((total // 100) if total else 0, 512 * 1024)
+            if fname != st["name"]:                 # 换了文件, 先报一次(progress 会归零)
+                st["name"], st["next"] = fname, step
+                self.q.put(("dl", {"name": fname, "done": done, "total": total}))
+                return
+            if done < total and done < st["next"]:  # 没到下一个刻度就跳过
+                return
+            st["next"] = done + step
+            self.q.put(("dl", {"name": fname, "done": done, "total": total}))
+
+        return cb
 
     def _run_queue(self, folders, full, jobs, run_id, force=False):
         # 明确记下"这轮真的处理完了哪些", 不能靠反推:
@@ -236,12 +257,20 @@ class Api:
                                     f"{os.path.basename(folder)}"))
                 return hit
 
-        model = self._model_path()
+        # 首次运行要下模型: 检测器 230KB, 关键点 5MB, 画质 108MB, aes_v25 更是 1.7GB。
+        # 在主进程带进度地把它们补全 (界面显示进度条, 不然会以为卡死); 下完后子进程里的
+        # ensure_asset 直接命中, 不会重复下载。
+        dx = self._dl_progress()
+        model = self._model_path(on_progress=dx)
         # 注意: 不建 out_dir, 也不传 preview_dir —— 除结果缓存外一个文件都不写
         self._last_full = bool(full)
         # worker 是 spawn 出来的, 读不到本进程对 _CFG 的改动, 美感模型必须显式传
         aes_model = cull.aesthetic_model_name()
-        cull.worker_init(model, full, None, 0, 1 if jobs > 1 else 0, aes_model)
+        try:
+            cull.worker_init(model, full, None, 0, 1 if jobs > 1 else 0, aes_model,
+                             on_progress=dx)
+        finally:
+            self.q.put(("dl_done", ""))       # 无论成没成, 都让界面把进度条收掉
         rows = []
         if jobs > 1 and len(names) > 1:
             from concurrent.futures import as_completed
@@ -397,6 +426,9 @@ class Api:
                 "n_faces": r.get("faces", 0),
                 "subject_idx": r.get("subject_idx", -1),
                 "face_metrics": (r.get("_face_metrics") or [])[:12],
+                # 人脸框 (原图像素, 和 face_metrics 同一顺序)。界面靠它把 #N 编号
+                # 贴到脸框上沿 —— 光有 cx/cy(归一化中心) 只能把编号糊在脸中间。
+                "face_boxes": (r.get("_face_boxes") or [])[:12],
                 "meta": " · ".join(x for x in [
                     (f'修图价值 {r["edit_value"]:.0f}' if r.get("edit_value") is not None else ""),
                     f'组{r["group"]}({gs}张)' if gs > 1 else "",
@@ -588,6 +620,18 @@ class Api:
         只写本地配置文件, 不联网。返回 ollama_advise.save_settings() 的结果。
         """
         return ollama_advise.save_settings(settings or {})
+
+    def get_aesthetic_model(self):
+        """当前美感模型名 (nima / aes_v25), 供顶部下拉回填。"""
+        return cull.aesthetic_model_name()
+
+    def set_aesthetic_model(self, name):
+        """切换美感模型并写进 cull_config.json, 下次「开始分析」生效。
+
+        换模型会让已有结果缓存自动作废 (read_cache 校验 aesthetic_model 不匹配就重扫),
+        所以这里不需要额外清缓存。
+        """
+        return cull.save_aesthetic_model(name)
 
     def _run_advise(self, folder, names, dest, model, aid):
         """后台线程: 解码 -> 算色料统计 -> 发给 Ollama -> 推结果。

@@ -112,9 +112,10 @@ venv\Scripts\python.exe app.py
 venv\Scripts\python.exe app.py "D:\照片\2026-08-21"   # 带文件夹直接启动
 ```
 
-首次运行会**联网下载** YuNet 模型（230KB）到 `%TEMP%\cmdc_cull\` 或
-`%ProgramData%\cmdc_cull\`。离线环境要提前把 `face_detection_yunet_2023mar.onnx`
-放进那两个目录之一。
+模型下到 `cull.model_dir()`（打包后 = exe 同级的 `_internal\models\`，源码 = 工具目录
+`models\`）。首次点「开始分析」时**在主进程带进度地**把它们补全（检测器 230KB，关键点
+5MB，画质 108MB，`aes_v25` 更是 1.7GB），界面顶部显示进度条；下完后子进程里的
+`ensure_asset()` 直接命中，不重复下载。离线环境把模型预置到那个目录即可。
 
 ### 3.2 命令行
 
@@ -182,7 +183,7 @@ folder                 照片目录; 不给则进入交互式(可拖文件夹进
 | `analyze(path, detector, ...)` | **单张核心**：检测人脸 → 逐脸算眼睛锐度 → 取最清楚那张当主体 → 出缩略图 | **最高** |
 | `measure_face(gray, ...)` | 量单张脸的眼部锐度；选脸和"手动换主体"**必须共用**同一口径 | 高 |
 | `pick_subject(gray, faces, ...)` | 遍历所有脸，返回 (主体, 全部框, 全部指标) | 中 |
-| `reselect_subject(row, ...)` | 手动换主体：按需重解码单张并重算 sig/锐度/缩略图 | 中 |
+| `reselect_subject(row, ...)` | 手动换主体：按需重解码单张并重算 sig / 眼部+整脸锐度 / **yaw+ear** / 缩略图 | 中 |
 | `tenengrad_map` / `patch_sharpness` | Tenengrad 梯度能量 | 高 |
 | `face_signature` | 人脸区域归一化灰度指纹，用于判断两帧是否同一姿势 | 中 |
 | `model_dir` / `ensure_asset` / `_opencv_loadable` | 模型目录(`_internal\models`) + 按需下载 + 中文路径镜像 | 中 |
@@ -240,6 +241,14 @@ folder                 照片目录; 不给则进入交互式(可拖文件夹进
 **并发模型**：一个后台线程跑 `_run_queue`，所有进展通过 `queue.Queue` 传给
 `poll()`。取消靠 `threading.Event`。`_run_id` 用来作废过期轮次的消息。
 
+**模型下载进度**：`_dl_progress()` 返回一个节流回调（每个文件开头报一次，之后每涨约 1%
+或 512KB 再报——不节流的话 1.7GB 的 aes_v25 会推几千条消息），经
+`("dl", {name, done, total})` 推给界面画进度条，`("dl_done", "")` 收掉。
+下载发生在 `_analyze_one` 里**缓存命中判断之后**（命中缓存不用下模型），`finally` 里发
+`dl_done`。`cull._download()` 按 256KB 分块读并回调；远端不给 `Content-Length` 时
+`total=0`，界面退化成"不定长动画 + 已下载 X MB"。⚠ 下载跑在主进程的后台线程里，
+此时点「取消」**不会**中断下载（要等下载完才生效）。
+
 **排序（`Api._order_rows()`）**：界面排序下拉框三选一，决定同组照片是否挨在一起。
 
 | `sort` | 行为 |
@@ -274,8 +283,17 @@ venv\Scripts\python.exe build.py
 
 > ⚠️ **只能拷整个文件夹，不能只拷 exe**。依赖全在 `_internal/` 里。
 
+**模型会一起打进包**：`build.py` 若发现项目下有 `models\`（已下好的模型，不进版本库），
+就用 `--add-data` 把整个目录塞进 `_internal\models`。打包后 `cull.model_dir()` 返回
+`_MEIPASS\models`（= `_internal\models`），`ensure_asset()` 见文件已在就不再联网下载 →
+**本地打包、拷到别的机器都是开箱离线可用**。`models\` 不存在（全新 clone）就跳过，装出来
+首次运行仍按需下载。注意 `models\` 里可能含 **1.72GB 的 aes_v25**，会让成品涨到约 2GB、
+打包也明显变慢；只要小模型（yunet/landmark/musiq/nima，约 128MB）就够默认配置用。
+
 `build.py` 用的是 PyInstaller 的 Python API 而不是命令行，目的是绕开
-cmd.exe 管道的编码问题（控制台代码页会把中文路径搞坏）。
+cmd.exe 管道的编码问题（控制台代码页会把中文路径搞坏）。它**现场从 `app.py` 生成 spec**
+（`--specpath %TEMP%\cmdc_cull_build`），并**不使用**仓库里的 `app.spec`；`app.spec` 只是
+留给 `pyinstaller app.spec` 的等价配置，改动打包参数时两边一起改，别只改一边。
 
 ### app.spec 里几个非默认设置
 
@@ -362,6 +380,10 @@ excludes=[matplotlib, scipy, pandas, PyQt5, PySide6, IPython, ...]
   `cull_config.json`）；模型下拉只列本地**支持视觉**的模型，旁边可「拉取」新模型。不配的话
   默认 `127.0.0.1:11434` + `qwen2.5vl:7b`。16GB 显存下 7B~12B 的 4bit 量化模型都行。
   **模型必须已经 `ollama pull` 过**，否则面板提示拉取。
+  ⚠ 连不上 Ollama 时**别一直弹错**：`loadModels({quiet:true})` 的调用（启动、结果页铺开、
+  拉取完刷新）只把下拉的占位文字改成「连不上 Ollama」、**不**弹提示；只有用户主动点的入口
+  （`bAdvRefresh` / 保存地址 / `bAdvPull` / `bAdvise`）才真正报错。改这块时别把自动调用改回
+  会弹提示的版本 —— 没开 Ollama 是常态，每切一次文件夹弹一条很烦。
 - **关键设计：数值来自程序，风格判断才交给模型。** `compute_color_stats()` 给的是真实
   的 RGB 均值/分位、高光溢出、死黑、对比度、饱和度、色度、R/B 比、曝光估计；模型只负责
   "审美判断 + 把客观数字翻译成人话"。小模型（4B~7B）**直接看图报数值不准**，别让它瞎猜。
@@ -721,7 +743,9 @@ B 图的第 1 张脸比，主体就漂了。
   但两个模型的**排序分歧不小**（实测 60 张 Spearman 只有 0.46），别混着比。
 - ⚠ **每个 worker 进程各自建 session**，`aes_v25` 是 **2GB/进程**。4 进程 = 约 8GB 内存，
   低配机器请同时调小 `--jobs`。
-- 换模型后缓存自动作废（`aesthetic_model` 写进缓存并在 `read_cache` 里校验）。
+- 缓存按模型累加 aes（v6 起每条记录存成 `{模型: 分数}`）：换模型**不再整份作废**，
+  切回用过的模型直接命中缓存；只有"当前模型这一张还没算过"才整份重扫。
+  其它四个维度与模型无关，天然共享。
 - **GPU 加速（DirectML）这条路走不通**：DirectML EP 不支持 `Run()` 并发，且
   onnxruntime 1.18+ 的 Python 绑定在多线程/多进程建 session 时会崩（官方 issue
   #20713/#22867），与本项目的多进程模型直接冲突；ROCm 在 Windows 也不支持消费级 Radeon。
@@ -784,6 +808,7 @@ venv\Scripts\python.exe cull.py "D:\测试照片" --out "$env:TEMP\culltest" --p
 venv\Scripts\python.exe build.py
 Test-Path ..\_cull_dist\选图工具\_internal\webview\js\api.js
 Test-Path ..\_cull_dist\选图工具\_internal\ui.html
+Test-Path ..\_cull_dist\选图工具\_internal\models\face_detection_yunet_2023mar.onnx   # 本地有 models\ 时
 ```
 
 **不要提交**：`venv/`、`_cull_dist/`、`_build/`、`_cull_out/`、`__pycache__/`

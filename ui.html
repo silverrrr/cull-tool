@@ -2,7 +2,10 @@
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>选图工具</title>
 <style>
-  body{background:#18181b;color:#e9e9ec;font:14px/1.6 system-ui,"Microsoft YaHei",sans-serif;margin:0;padding:0}
+  body{background:#18181b;color:#e9e9ec;font:14px/1.6 system-ui,"Microsoft YaHei",sans-serif;margin:0;padding:0;
+       /* 缩略图框的统一高度。只能用绝对长度: 百分比 max-height 在高度不确定的父元素上
+          会被当成 none, 照片就会溢出这个框、被卡片的 overflow:hidden 悄悄裁掉。 */
+       --thumb-h:280px}
   h1{font-size:18px;margin:0}
   button{background:#33333c;color:#e9e9ec;border:1px solid #46464f;border-radius:6px;padding:6px 12px;font:inherit;font-size:13px;cursor:pointer}
   button:hover{background:#3d3d47}
@@ -30,8 +33,22 @@
   .fitem.ok  .tag{background:#27ae60;color:#062}
   .fitem.err .tag{background:#c0392b;color:#fff}
   .fitem button{padding:1px 8px;font-size:12px}
+  /* 结果页同一时刻只显示一个文件夹, 靠点这个列表来回切 —— 得让"能点"看得出来 */
+  .fitem.ok,.fitem.err{cursor:pointer}
+  .fitem.ok:hover,.fitem.err:hover{background:#2e2e38}
+  .fitem.ok:hover .p,.fitem.err:hover .p{color:#e2e2e8}
+  /* 当前正在看的是哪一个 */
+  .fitem.cur{background:#27313d;box-shadow:inset 3px 0 0 #2f7fd8}
+  .fitem.cur .p{color:#dbe6f3}
 
   #status{margin-top:9px;font-size:12.5px;color:#8f8f99;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* 首次运行的模型下载进度条 (musiq 108MB / aes_v25 1.7GB 那种) */
+  #dl{display:flex;align-items:center;gap:10px;margin-top:8px}
+  #dlText{font-size:12.5px;color:#9fb8d8;flex:0 0 auto;white-space:nowrap}
+  #dlTrack{flex:1;max-width:520px;height:8px;background:#2a2a31;border-radius:99px;overflow:hidden}
+  #dlFill{height:100%;width:0;background:#2f7fd8;transition:width .2s linear}
+  #dlTrack.indet #dlFill{width:30%;animation:dlslide 1.1s ease-in-out infinite}
+  @keyframes dlslide{0%{margin-left:0}50%{margin-left:70%}100%{margin-left:0}}
 
   /* ---- 筛选栏 ---- */
   #bar{background:#202024;border-bottom:1px solid #2e2e36;padding:10px 16px;position:sticky;top:0;z-index:20}
@@ -48,6 +65,7 @@
   #ollamaCfg{margin-top:10px;padding-top:10px;border-top:1px solid #2e2e36;
              display:flex;align-items:center;gap:9px;flex-wrap:wrap}
   #advModel{max-width:240px}
+  #aesModel{max-width:240px}
   #advHost{width:160px}
   #advPullName{width:200px}
   #advProg{font-size:12px}
@@ -100,11 +118,31 @@
   .sechead .tag{font-size:11px;padding:1px 7px;border-radius:99px;background:#3a3a42;color:#bbb}
   .sechead .tag.warn{background:#8a6d1f;color:#ffe9a8}
   #empty{padding:70px 20px;text-align:center;color:#8f8f99}
+  /* 点队列条里"出错"的文件夹 -> 就地摊开完整 traceback (要 pre-wrap + 等宽) */
+  #empty.err{text-align:left;white-space:pre-wrap;font-family:Consolas,monospace;
+             font-size:12px;line-height:1.5;color:#c9c9d2;max-width:1000px;margin:0 auto}
   .card{background:#242429;border-radius:10px;overflow:hidden;border:2px solid transparent;position:relative}
   .card.soft{border-color:#c0392b}
   .card.best{border-color:#27ae60}
   .card.sel{border-color:#2f7fd8}
-  .card img{width:100%;display:block;cursor:zoom-in}
+  /* 缩略图统一高度: 竖屏/横屏混排时网格才不会一行高一行矮(横图下面拖一片空白)。
+     照片按原比例整体塞进这个框 —— 不裁剪 —— 多余的部分露深色底。
+     ⚠ .imwrap 必须正好等于**照片显示区域**: 人脸编号 #N 是按百分比定位在它上面的,
+     照片不能直接放 .thumbwrap 里, 否则百分比按整个框算, 编号会飘到黑边上。 */
+  .thumbwrap{height:var(--thumb-h,280px);display:flex;align-items:center;justify-content:center;
+             background:#0f0f12}
+  .imwrap{position:relative;line-height:0}
+  /* 不要用 object-fit:contain —— 那样元素的框还是满宽×等高, 只是把画面缩在框里居中,
+     #N 的百分比就按含黑边的框算了。这里让元素自身按比例缩到 ≤框宽 且 ≤框高,
+     元素框 == 画面区域, 编号才贴得准。 */
+  .imwrap img{display:block;width:auto;height:auto;
+              max-width:100%;max-height:var(--thumb-h,280px);cursor:zoom-in}
+  /* 编号贴在脸框上沿、水平居中于这张脸 —— 不再糊在五官上 */
+  .fmark{position:absolute;z-index:2;pointer-events:none;
+         transform:translate(-50%,calc(-100% - 2px));
+         background:rgba(0,0,0,.62);color:#dcdce2;border:1px solid rgba(255,255,255,.26);
+         border-radius:3px;padding:0 3px;font-size:10px;line-height:1.35;font-weight:600}
+  .fmark.cur{background:#c0392b;color:#fff;border-color:#e05a4a}
   .pick{position:absolute;top:7px;left:7px;z-index:3;background:rgba(0,0,0,.55);border-radius:5px;padding:2px 5px}
   .pick input{width:16px;height:16px;vertical-align:middle;cursor:pointer}
   .info{padding:8px 10px;font-size:12.5px}
@@ -152,6 +190,12 @@
     <button id="bCancel" class="pri" style="display:none" disabled>取消</button>
     <label><input type="checkbox" id="cFull"> 全分辨率(慢一些)</label>
     <label><input type="checkbox" id="cForce"> 忽略缓存重扫</label>
+    <label title="选片用的美感模型: NIMA 快而够用; Aesthetic V2.5 更准但首次会下载约 1.7GB 模型、算分慢很多。换模型后下次分析会自动重扫 (缓存作废)">美感模型
+      <select id="aesModel">
+        <option value="nima">NIMA (快, 默认)</option>
+        <option value="aes_v25">Aesthetic V2.5 (更准, 约1.7GB)</option>
+      </select>
+    </label>
     <div class="sp"></div>
     <span class="muted" style="font-size:12px">结果只在这个窗口里看, 不写照片文件夹</span>
   </div>
@@ -169,6 +213,10 @@
   </div>
   <div id="folders"></div>
   <div id="status">就绪 — 先选文件夹, 再点「开始分析」</div>
+  <div id="dl" style="display:none">
+    <span id="dlText"></span>
+    <div id="dlTrack"><div id="dlFill"></div></div>
+  </div>
 </div>
 
 <div id="bar" style="display:none">
@@ -267,19 +315,47 @@ function say(t, bad){
   m._t = setTimeout(function(){ m.style.display='none'; }, bad ? 7000 : 3200);
 }
 
+/* 首次运行下载模型时的进度条 (消息来自 Python 的 ("dl", {...}) / ("dl_done", "")) */
+function fmtMB(n){ return (n / 1048576).toFixed(1); }
+function showDl(d){
+  d = d || {};
+  var box = $('dl'); if (!box) return;
+  box.style.display = 'flex';
+  var track = $('dlTrack'), fill = $('dlFill');
+  var name = d.name || '模型';
+  if (d.total){                       // 远端给了 Content-Length -> 显示百分比
+    var pct = Math.max(0, Math.min(100, d.done * 100 / d.total));
+    track.classList.remove('indet');
+    fill.style.width = pct.toFixed(1) + '%';
+    $('dlText').textContent = '正在下载模型 ' + name + '  ' + pct.toFixed(0) + '%  (' +
+      fmtMB(d.done) + ' / ' + fmtMB(d.total) + ' MB)';
+  } else {                            // 没有总大小 -> 不定长动画 + 已下多少
+    track.classList.add('indet');
+    $('dlText').textContent = '正在下载模型 ' + name + '  已下载 ' + fmtMB(d.done) + ' MB';
+  }
+}
+function hideDl(){
+  var box = $('dl'); if (!box) return;
+  box.style.display = 'none';
+  var f = $('dlFill'); if (f) f.style.width = '0';
+  var t = $('dlTrack'); if (t) t.classList.remove('indet');
+}
+
 /* ================= 文件夹队列 ================= */
 function drawFolders(){
   var box = $('folders');
   box.innerHTML = '';
   FOLDERS.forEach(function(f, idx){
     var d = document.createElement('div');
-    d.className = 'fitem ' + f.state;
+    d.className = 'fitem ' + f.state + (f.path === CUR ? ' cur' : '');
     var tag = f.state === 'run' ? '分析中' : (f.state === 'ok' ? '已完成' :
               (f.state === 'err' ? '出错' : '待分析'));
     d.innerHTML = '<span class="p"></span><span class="tag"></span>' +
                   '<button title="移除">×</button>';
     d.querySelector('.p').textContent = f.path;
     d.querySelector('.tag').textContent = tag;
+    d.querySelector('.p').title = '点这个文件夹可切换结果页' +
+      (f.err ? '\n上次出错: ' + String(f.err).split('\n')[0] : '');
     d.querySelector('button').onclick = async function(){
       // 正在分析中的文件夹不能从这里删, 要走「取消」
       if (f.state === 'run'){ say('正在分析中, 请先点「取消」', true); return; }
@@ -440,6 +516,8 @@ function handleMsgs(msgs){
   for (var i=0; i<msgs.length; i++){
     var m = msgs[i];
     if (m[0] === 'log') $('status').textContent = m[1];
+    else if (m[0] === 'dl') showDl(m[1]);
+    else if (m[0] === 'dl_done') hideDl();
     else if (m[0] === 'done') { setState(m[1], 'ok'); openFolder(m[1]); }
     else if (m[0] === 'error') {
       // (文件夹, 错误说明) —— 只显示第一行, 完整 traceback 放到 title 里备查
@@ -464,7 +542,7 @@ function handleMsgs(msgs){
       // 刚取消完的话别把"已取消"覆盖成"全部完成"
       if ($('status').textContent !== '正在停止…')
         $('status').textContent = FOLDERS.length
-          ? '全部完成 — 在上面点文件夹可以来回切'
+          ? '全部完成 — 结果页一次只显示一个文件夹, 点上面已完成的那几个可以来回切'
           : '就绪 — 先选文件夹, 再点「开始分析」';
       updateRun();
     }
@@ -508,7 +586,7 @@ function handleMsgs(msgs){
       $('advProg').textContent = '';
       say('模型拉取完成: ' + doneModel);
       // 刷新列表并把刚拉好的那个选中 (loadModels 是异步的, 等它填完再选)
-      loadModels().then(function(){
+      loadModels({quiet: true}).then(function(){
         var sel = $('advModel');
         if (!sel || !doneModel) return;
         for (var j = 0; j < sel.options.length; j++){
@@ -532,6 +610,7 @@ function resetView(){
   $('grid').innerHTML = '';
   $('bar').style.display = 'none';
   $('empty').style.display = '';
+  $('empty').className = '';          // 清掉"出错摊开"那套等宽左对齐的样式
   $('empty').textContent = '先在上面选一个照片文件夹, 然后点「开始分析」。';
   clearAdvice();
 }
@@ -539,6 +618,7 @@ function resetView(){
 async function openFolder(folder){
   resetView();
   CUR = folder;
+  drawFolders();                       // 队列条上把"当前看的是这一个"标出来
   $('empty').textContent = '正在载入…';
   $('status').textContent = folder;
   try {
@@ -642,7 +722,9 @@ function applyBatch(d, append){
   }
 
   $('bar').style.display = '';
-  if (!ADV_MODELS_OK) loadModels();   // 操作栏第一次露出来时补一次; 成功读到过就不再重复
+  // 操作栏第一次露出来时补一次; 成功读到过就不再重复。静默: 没开 Ollama 是常态,
+  // 不能每切一次文件夹就弹一条错误 (要报错等用户点「刷新模型」)
+  if (!ADV_MODELS_OK) loadModels({quiet: true});
   $('empty').style.display = TOTAL ? 'none' : '';
 
   // AF 区域下拉只填一次
@@ -676,7 +758,7 @@ function makeCard(c){
 
   el.innerHTML =
     '<div class="pick"><input type="checkbox" class="cb"></div>' +
-    '<img alt="">' +
+    '<div class="thumbwrap"><div class="imwrap"><img alt=""></div></div>' +
     '<div class="info">' +
       (c.badge || c.warn ? '<span class="badge"></span>' : '') +
       '<div class="name"></div><div class="sc"></div><div class="meta"></div>' +
@@ -713,6 +795,31 @@ function makeCard(c){
     lab.textContent = '主体';
     fp.appendChild(lab);
     fp.appendChild(sel);
+    // 在图上也按同样的 #N 标出每张脸, 贴在脸框**上沿**(不再糊在五官上), 否则光看下拉
+    // 不知道选的是谁。face_metrics 只有归一化中心 cx/cy, 拿不到脸框上沿 —— 用同一顺序的
+    // face_boxes[i] = [fx,fy,fw,fh](原图像素) 反推原图宽高, 再换算成百分比。
+    // 注意定位在 .imwrap 上 (它正好等于照片显示区域), 不是外面那个等高框
+    var wrap = el.querySelector('.imwrap');
+    var fbs = c.face_boxes || [];
+    fm.forEach(function(m, i){
+      if (m.cx == null || m.cy == null) return;
+      var b = document.createElement('span');
+      b.className = 'fmark' + (m.idx === c.subject_idx ? ' cur' : '');
+      b.textContent = '#' + (m.idx + 1);
+      b.style.left = (m.cx * 100) + '%';
+      var fb = fbs[i];
+      var topPct = null;
+      if (fb && m.cx > 0 && m.cy > 0){
+        var W = (fb[0] + fb[2] / 2) / m.cx;
+        var H = (fb[1] + fb[3] / 2) / m.cy;
+        if (W > 0 && H > 0) topPct = fb[1] / H * 100;
+      }
+      // 脸贴着画面顶端时编号会被 .card 的 overflow 裁掉, 往下压到 7%
+      b.style.top = (topPct == null ? m.cy * 100 : Math.max(topPct, 7)) + '%';
+      b.title = '第 ' + (m.idx + 1) + ' 张脸  眼部锐度 ' + Math.round(m.eye)
+              + '  脸宽 ' + m.w + 'px';
+      wrap.appendChild(b);
+    });
     sel.onchange = async function(ev){
       ev.stopPropagation();
       var idx = parseInt(sel.value, 10);
@@ -762,13 +869,28 @@ function makeCard(c){
   return el;
 }
 
-/* 队列条上点已完成文件夹 -> 切回它 */
+/* 队列条上点文件夹 -> 切到它。结果页一次只装得下一个文件夹, 这是唯一的切换入口,
+   所以已完成和出错的都要有反应 (出错的点开就地摊开原因, 否则只能看一闪而过的提示) */
 document.querySelector('#folders').addEventListener('click', function(e){
   var it = e.target.closest('.fitem');
   if (!it || e.target.tagName === 'BUTTON') return;
   var p = it.querySelector('.p').textContent;
-  if (it.classList.contains('ok')) openFolder(p);
+  var f = FOLDERS.filter(function(x){ return x.path === p; })[0];
+  if (!f) return;
+  if (f.state === 'ok') openFolder(p);
+  else if (f.state === 'err') showFolderErr(f);
+  else if (f.state === 'run') say('这个文件夹正在分析中…');
+  else say('这个文件夹还没分析, 点「开始分析」');
 });
+
+/* 出错的文件夹: 就地摊开完整错误 (含 traceback), 别只弹一条会自己消失的提示 */
+function showFolderErr(f){
+  resetView();
+  drawFolders();                       // resetView 把 CUR 清空了, 重画一次去掉旧的"当前"标记
+  var el = $('empty');
+  el.className = 'err';
+  el.textContent = '「' + f.path + '」分析失败\n\n' + (f.err || '未知错误');
+}
 
 /* ================= 筛选 ================= */
 function applyFilter(){
@@ -1049,8 +1171,13 @@ function advSelPlaceholder(sel, text){
 }
 
 /* 读本机 Ollama 已安装的视觉模型填进 #advModel。
+
+   quiet=true 的调用 (启动、结果页第一次铺开、拉取完刷新) 不弹错误提示 —— 没开 Ollama
+   是常态, 每次铺结果页都弹一条"无法连接本地 Ollama"很烦。连不上就把下拉的占位文字
+   改成"连不上", 等用户真去点「刷新模型」/「保存地址」/「AI 调色建议」时再明确报错。
    模型名/参数大小是外部字符串, 全部走 createElement/textContent, 绝不用 innerHTML。 */
-async function loadModels(){
+async function loadModels(opts){
+  var quiet = !!(opts && opts.quiet);
   var sel = $('advModel');
   if (!sel || ADV_MODELS_LOADING) return;
   ADV_MODELS_LOADING = true;
@@ -1078,14 +1205,17 @@ async function loadModels(){
       if (keep) sel.value = prev;
       ADV_MODELS_OK = true;
     } else {
-      advSelPlaceholder(sel, '（没有本地视觉模型, 请先拉取）');
+      // 连不上和"连上了但没装视觉模型"是两回事, 占位文字要分开 —— 否则没开 Ollama
+      // 时下拉写着"请先拉取", 用户会以为要下载模型, 其实是服务没起来
+      advSelPlaceholder(sel, r && r.error ? '（连不上 Ollama, 点「刷新模型」重试）'
+                                          : '（没有本地视觉模型, 请先拉取）');
       ADV_MODELS_OK = false;
-      if (r && r.error) say(r.error, true);
+      if (r && r.error && !quiet) say(r.error, true);
     }
   } catch(e){
     advSelPlaceholder(sel, '（读取模型列表失败, 点「刷新模型」重试）');
     ADV_MODELS_OK = false;
-    say('获取模型列表失败: ' + e, true);
+    if (!quiet) say('获取模型列表失败: ' + e, true);
   }
   sel.disabled = false;
   ADV_MODELS_LOADING = false;
@@ -1149,6 +1279,45 @@ async function saveOllamaSettings(){
     if (b) b.disabled = false;
   }
 }
+
+/* ---- 美感模型 (nima / aes_v25): 写进 cull_config.json, 下次「开始分析」生效 ---- */
+var AES_LOADED = false;   // waitApi 可能触发多次, 只回填一次
+
+/* 启动时把后端实际生效的模型回填到下拉 (读不到就保持默认 nima) */
+async function loadAestheticModel(){
+  if (AES_LOADED) return;
+  AES_LOADED = true;
+  try {
+    var m = await api.get_aesthetic_model();
+    if (m && $('aesModel')) $('aesModel').value = String(m);
+  } catch(e){ /* 桥还没就绪, 保持默认值 */ }
+}
+
+async function onAesModelChange(){
+  var sel = $('aesModel');
+  var name = sel.value;
+  // 大模型首次分析会自动下约 1.7GB, 先确认一下, 免得用户以为程序卡住了
+  if (name === 'aes_v25' && !confirm(
+      'Aesthetic V2.5 模型约 1.7GB, 首次分析会自动下载, 且每张算分明显更慢。\n确定切换?')){
+    try { sel.value = String(await api.get_aesthetic_model()); } catch(e){ sel.value = 'nima'; }
+    return;
+  }
+  sel.disabled = true;
+  try {
+    var r = await api.set_aesthetic_model(name);
+    if (r && r.ok){
+      say('美感模型已切换为 ' + r.model + ' — 下次「开始分析」生效 (缓存会自动作废)');
+    } else {
+      say((r && r.error) || '切换美感模型失败', true);
+      try { sel.value = String(await api.get_aesthetic_model()); } catch(e){ sel.value = 'nima'; }
+    }
+  } catch(e){
+    say('切换美感模型失败: ' + e, true);
+  } finally {
+    sel.disabled = false;
+  }
+}
+$('aesModel').onchange = onAesModelChange;
 
 function mkEl(tag, cls, text){
   var d = document.createElement(tag);
@@ -1288,6 +1457,7 @@ $('bAdvCancel').onclick = async function(){
     say('取消失败: ' + e, true);
   }
 };
+// 用户主动点的入口 (刷新模型 / 保存地址 / AI 调色建议) -> 连不上要明确报错, 不传 quiet
 $('bAdvRefresh').onclick = function(){ loadModels(); };
 $('bAdvSave').onclick = saveOllamaSettings;
 $('bAdvPull').onclick = pullModel;
@@ -1296,8 +1466,9 @@ $('bAdvPull').onclick = pullModel;
 function waitApi(){
   if (window.pywebview && window.pywebview.api){
     api = window.pywebview.api;
-    if (!ADV_MODELS_OK) loadModels();   // 桥一就位就把模型下拉填上 (读不到也不影响别的)
+    if (!ADV_MODELS_OK) loadModels({quiet: true});  // 桥一就位就把模型下拉填上 (读不到也不影响别的)
     loadOllamaSettings();               // 顺带读回后端保存的 Ollama 地址 (失败静默)
+    loadAestheticModel();               // 回填美感模型下拉 (失败静默, 保持默认 nima)
     syncQueue();
     if (!pollStarted) startPolling();
     return;
